@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
 ## Providers
 
 ```rust
-use tkach::providers::{Anthropic, OpenAICompatible, OpenAIResponses};
+use tkach::providers::{Anthropic, OpenAICodex, OpenAICompatible, OpenAIResponses};
 
 // Anthropic
 let p = Anthropic::from_env();   // ANTHROPIC_API_KEY
@@ -127,6 +127,38 @@ let p = OpenAICompatible::new("ignored")
 ```
 
 Implementing your own provider: implement `LlmProvider` (one `complete` and one `stream` method).
+
+### OpenAI ChatGPT Codex subscription
+
+`OpenAICodex` targets the ChatGPT subscription Codex backend at `https://chatgpt.com/backend-api/codex/responses`. Wire grammar matches `OpenAIResponses` (same SSE events: `response.output_text.delta`, atomic `function_call`, `response.reasoning_summary_text.*`), so text, tool calls, and reasoning summaries flow through the standard `StreamEvent` API.
+
+Credentials are caller-owned. The provider does **not** implement OAuth login, refresh-token exchange, environment-variable lookup, keyring storage, or account discovery — it asks a `CodexCredentialsProvider` for fresh credentials before every request and surfaces `401` to the caller without internal retry.
+
+```rust
+use async_trait::async_trait;
+use tkach::ProviderError;
+use tkach::providers::{CodexCredentials, CodexCredentialsProvider, OpenAICodex};
+
+struct MyTokenCache { /* OAuth client, refresh logic, keyring ... */ }
+
+#[async_trait]
+impl CodexCredentialsProvider for MyTokenCache {
+    async fn credentials(&self) -> Result<CodexCredentials, ProviderError> {
+        // Call your token cache here. Refresh on expiry; surface errors otherwise.
+        Ok(CodexCredentials::new("access-token", "account-id"))
+    }
+}
+
+let provider = OpenAICodex::new(MyTokenCache { /* ... */ })
+    .with_originator("my-app");                // optional, defaults to "tkach"
+
+// Static credentials are useful for tests and short-lived scripts:
+let provider = OpenAICodex::with_static_credentials(
+    CodexCredentials::new("token", "acct"),
+);
+```
+
+The Codex subscription backend is undocumented and unstable. Wire shape and event names can change without notice — pin a `tkach` version you have validated end-to-end if you ship this in production. See `examples/streaming_openai_codex.rs`.
 
 ### Anthropic prompt caching
 
