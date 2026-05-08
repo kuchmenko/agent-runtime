@@ -74,9 +74,28 @@ problems, doc-test fail under the published-crate build) **before** the
 Release PR is merged — i.e., before release-please has cut a tag that
 the real `cargo publish` would have to consume.
 
-### Manual override
+### Recovery: auto-publish failed
 
-If you need to force a specific version or release out-of-band:
+`release-please-action` sets its `release_created` output to `true` only on
+the run that actually creates the GitHub Release. If the publish step fails
+on that run (transient crates.io error, missing token, the like), simply
+re-running the workflow does **not** help — the rerun sees the existing
+release and returns `release_created=false`, so both `ci` and `publish`
+get skipped.
+
+The recovery path is the manual `Run workflow` button:
+
+1. GitHub → Actions → Release → **Run workflow**.
+2. Set `tag` to the existing release tag (e.g. `tkach-v0.4.1`).
+3. The `publish-manual` job checks out that tag and runs `cargo publish`
+   using the same `CARGO_REGISTRY_TOKEN` secret.
+
+This skips re-running the CI suite — the tag already passed CI on the
+original auto-run, the failure was specifically in the publish step.
+
+### Manual override: out-of-band release
+
+If you need to cut a release without going through release-please:
 
 ```
 git tag tkach-vX.Y.Z
@@ -84,5 +103,4 @@ git push origin tkach-vX.Y.Z
 ```
 
 The `tkach-` prefix matches release-please's tag format. After pushing,
-publish manually with `cargo publish --token <token>` — the automated
-publish workflow only fires on release-please-driven releases.
+trigger the publish workflow manually as in the recovery section above.
