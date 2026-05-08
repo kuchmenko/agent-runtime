@@ -2,43 +2,105 @@
 
 ## Versioning
 
-This project uses [Semantic Versioning](https://semver.org/):
+This project uses [Semantic Versioning](https://semver.org/) shaped by
+release-please's pre-1.0 bumping flags:
 
-- **Pre-1.0**: `0.MINOR.PATCH` — no stable API guarantees
-  - Bump **MINOR** for breaking changes or significant features
-  - Bump **PATCH** for bug fixes and small improvements
-- **Post-1.0**: standard SemVer rules apply
+- **Pre-1.0**: `0.MINOR.PATCH` — no stable API guarantees.
+  - **Breaking** commits (`feat!:` / `fix!:`) bump **MINOR**.
+  - **Everything else** that triggers a release (`feat:` / `fix:`) bumps **PATCH**.
+- **Post-1.0**: standard SemVer.
+  - `feat!:` / `fix!:` → MAJOR, `feat:` → MINOR, `fix:` → PATCH.
+
+The pre-1.0 behaviour is configured by these `release-please-config.json` flags:
+
+- `bump-minor-pre-major: true` — keeps breaking commits at MINOR (instead
+  of MAJOR) while we're below 1.0.
+- `bump-patch-for-minor-pre-major: true` — keeps non-breaking `feat:`
+  commits at PATCH (instead of MINOR) while we're below 1.0.
+
+The net effect: the MINOR digit signals "API broke", the PATCH digit
+covers everything else — features, fixes, internals.
 
 ## How releases work
 
-This project uses [release-please](https://github.com/googleapis/release-please) for automated releases.
+This project uses [release-please](https://github.com/googleapis/release-please)
+for automated releases and `cargo publish` for distribution to crates.io.
 
 ### Commit conventions
 
 Commits must follow [Conventional Commits](https://www.conventionalcommits.org/):
 
 ```
-feat: add OpenAI provider          → bumps MINOR (0.1.0 → 0.2.0)
-fix: handle empty tool response    → bumps PATCH (0.1.0 → 0.1.1)
-feat!: redesign Tool trait         → bumps MINOR (breaking, pre-1.0)
-chore: update dependencies         → no release
-docs: update README                → no release
+fix:   handle empty tool response  → bumps PATCH  (0.4.0 → 0.4.1)
+feat:  add OpenAI provider         → bumps PATCH  (0.4.0 → 0.4.1) — pre-1.0
+feat!: redesign Tool trait         → bumps MINOR  (0.4.0 → 0.5.0) — pre-1.0
+chore: bump dependencies           → no release
+docs:  update README               → no release
+ci:    tighten clippy gate         → no release
+refactor / test / perf             → no release
 ```
 
 ### Release flow
 
-1. Push conventional commits to `main`
-2. release-please automatically creates/updates a **Release PR** with:
-   - Version bump in `Cargo.toml`
-   - Updated `CHANGELOG.md`
-3. **Merge the Release PR** when ready to ship
-4. release-please creates a GitHub Release + git tag automatically
+1. Push conventional commits to `main`.
+2. release-please automatically opens or updates a **Release PR** with:
+   - Version bump in `Cargo.toml`.
+   - Updated `CHANGELOG.md`.
+3. **Merge the Release PR** when meaningful changes have accumulated.
+4. release-please cuts a GitHub Release + git tag from the merged commit.
+5. The Release workflow re-runs the full CI suite against the tagged
+   commit, then `cargo publish` ships the new version to crates.io.
 
-### Manual override
+Steps 4 and 5 are automatic. There is no manual `cargo publish` step.
 
-If you need to force a specific version or release out-of-band:
+### crates.io credential
+
+The `publish` job in `.github/workflows/release.yml` needs a crates.io
+API token in repo secret `CARGO_REGISTRY_TOKEN`.
+
+- Create the token at https://crates.io/settings/tokens with:
+  - **Scope:** `publish-update` only (no `publish-new` — the crate already exists).
+  - **Crate scope:** `tkach` (limit to this crate).
+  - **Expiry:** 1 year is reasonable.
+- Store it: `gh secret set CARGO_REGISTRY_TOKEN -R kuchmenko/tkach -b "<token>"`,
+  or via the GitHub UI: Settings → Secrets and variables → Actions →
+  New repository secret.
+
+### Why `cargo publish --dry-run` runs on every PR
+
+`ci-checks.yml` includes a `package` job that runs `cargo publish --dry-run`
+on every PR. This catches packaging issues (missing files, manifest
+problems, doc-test fail under the published-crate build) **before** the
+Release PR is merged — i.e., before release-please has cut a tag that
+the real `cargo publish` would have to consume.
+
+### Recovery: auto-publish failed
+
+`release-please-action` sets its `release_created` output to `true` only on
+the run that actually creates the GitHub Release. If the publish step fails
+on that run (transient crates.io error, missing token, the like), simply
+re-running the workflow does **not** help — the rerun sees the existing
+release and returns `release_created=false`, so both `ci` and `publish`
+get skipped.
+
+The recovery path is the manual `Run workflow` button:
+
+1. GitHub → Actions → Release → **Run workflow**.
+2. Set `tag` to the existing release tag (e.g. `tkach-v0.4.1`).
+3. The `publish-manual` job checks out that tag and runs `cargo publish`
+   using the same `CARGO_REGISTRY_TOKEN` secret.
+
+This skips re-running the CI suite — the tag already passed CI on the
+original auto-run, the failure was specifically in the publish step.
+
+### Manual override: out-of-band release
+
+If you need to cut a release without going through release-please:
 
 ```
-git tag vX.Y.Z
-git push origin vX.Y.Z
+git tag tkach-vX.Y.Z
+git push origin tkach-vX.Y.Z
 ```
+
+The `tkach-` prefix matches release-please's tag format. After pushing,
+trigger the publish workflow manually as in the recovery section above.

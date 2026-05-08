@@ -1,28 +1,26 @@
 # tkach
 
-A provider-independent agent runtime for Rust. Stateless agent loop, pluggable LLM providers, built-in file/shell tools, real SSE streaming, cooperative cancellation, and per-call approval gating.
+A provider-independent agent runtime for Rust. Stateless agent loop, pluggable LLM providers (Anthropic, OpenAI Responses, ChatGPT Codex, OpenAI-compatible), built-in file/shell tools, real SSE streaming with reasoning summaries, cooperative cancellation, and per-call approval gating.
 
 [![Crates.io](https://img.shields.io/crates/v/tkach.svg)](https://crates.io/crates/tkach)
 [![Docs.rs](https://img.shields.io/docsrs/tkach)](https://docs.rs/tkach)
 [![CI](https://github.com/kuchmenko/tkach/actions/workflows/ci.yml/badge.svg)](https://github.com/kuchmenko/tkach/actions/workflows/ci.yml)
 [![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **Status:** pre-1.0 (`0.3.0`). Breaking changes are signalled via `feat!:` conventional commits and recorded in [`CHANGELOG.md`](./CHANGELOG.md). The core API just stabilised across three milestones — foundation, streaming, approval — and is settling, but expect motion.
+> **Status:** pre-1.0 (`0.4.0`). Breaking changes are signalled via `feat!:` conventional commits and recorded in [`CHANGELOG.md`](./CHANGELOG.md). The core API has stabilised across foundation, streaming, approval, and reasoning milestones — and is settling — but expect motion.
 
-## Why this exists
-
-LLM agent runtimes tend to either (a) bake in a single provider and hide the loop, or (b) give you primitives without a working loop. This crate sits in the middle:
+## Features
 
 - **Stateless `Agent::run`** — caller owns the message history; the agent returns the **delta** of new messages it appended. Resume, multi-turn chat, fork & retry all become composable.
-- **Atomic event semantics under streaming** — `ToolUse` events are emitted whole, never as partial JSON, regardless of how the upstream chunks them.
-- **Sub-agents inherit the parent's executor** — one `ApprovalHandler`, one `ToolPolicy`, one tool registry gates the whole agent tree without explicit re-plumbing (Model 3).
-- **Cooperative cancellation propagates** — a single `CancellationToken` shuts down the loop, the SSE pull, the in-flight HTTP body, and any `bash` child process via `kill_on_drop`.
+- **Atomic events with one cancel surface** — `ToolUse` events are emitted whole, never as partial JSON; a single `CancellationToken` shuts down the loop, the SSE pull, the in-flight HTTP body, and any `bash` child process via `kill_on_drop`.
+- **Provider parity, including reasoning** — Anthropic (adaptive and manual extended thinking), OpenAI Responses (reasoning summary), ChatGPT Codex (subscription endpoint), and any OpenAI-compatible Chat Completions endpoint share one `StreamEvent` API surface — not three SDKs.
+- **Sub-agents inherit the parent's executor** — one `ApprovalHandler`, one `ToolPolicy`, one tool registry gate the whole agent tree without explicit re-plumbing (Model 3).
 
 ## Quick start
 
 ```toml
 [dependencies]
-tkach = "0.3"
+tkach = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -51,6 +49,8 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+> **New to tkach?** Run `cargo run --example basic` for a ~30-line working agent against Anthropic, or `cargo run --example streaming` for the streaming variant. Full list under [Examples](#examples) below.
+
 ## Architecture at a glance
 
 ```
@@ -68,9 +68,9 @@ async fn main() -> anyhow::Result<()> {
                 │ Anthropic  │                 │ │  ToolPolicy   │ │
                 │ OpenAI     │                 │ ├───────────────┤ │
                 │ Responses/ │                 │ │ApprovalHandler│ │
-                │ compatible │                 │ ├───────────────┤ │
-                │ Mock       │                 │ │ ToolRegistry  │ │
-                │            │                 │ └───────────────┘ │
+                │ Codex/     │                 │ ├───────────────┤ │
+                │ compatible │                 │ │ ToolRegistry  │ │
+                │ Mock       │                 │ └───────────────┘ │
                 └────────────┘                 └─────────┬─────────┘
                                                          │
                                               read-only batches in
@@ -80,39 +80,34 @@ async fn main() -> anyhow::Result<()> {
 
 ## Built-in tools
 
-| Tool        | Class      | What it does |
-|-------------|------------|--------------|
-| `Read`      | ReadOnly   | Read file contents (numbered lines, offset/limit) |
-| `Glob`      | ReadOnly   | Find files matching a glob (sorted by mtime) |
-| `Grep`      | ReadOnly   | Regex search in files (with context, ignore patterns) |
-| `WebFetch`  | ReadOnly   | HTTP GET a URL, returns body text |
-| `Write`     | Mutating   | Write a file (creates parents) |
-| `Edit`      | Mutating   | Replace exact string in a file |
-| `Bash`      | Mutating   | Run shell command (cancel-aware via `kill_on_drop`) |
-| `SubAgent`  | Mutating   | Spawn a nested agent that inherits the parent's tools |
+Read-only (`ToolClass::ReadOnly` — batched in parallel):
+
+- `Read` — read file contents (numbered lines, offset/limit).
+- `Glob` — find files matching a glob (sorted by mtime).
+- `Grep` — regex search in files (with context, ignore patterns).
+- `WebFetch` — HTTP GET a URL, returns body text.
+
+Mutating (`ToolClass::Mutating` — executed sequentially):
+
+- `Write` — write a file (creates parents).
+- `Edit` — replace an exact string in a file.
+- `Bash` — run a shell command (cancel-aware via `kill_on_drop`).
+- `SubAgent` — spawn a nested agent that inherits the parent's tools and policies.
 
 `tools::defaults()` returns `Read + Write + Edit + Glob + Grep + Bash`. Add `WebFetch` and `SubAgent::new(provider, model)` explicitly when you want them.
 
 ## Providers
 
 ```rust
-use tkach::providers::{Anthropic, OpenAICodex, OpenAICompatible, OpenAIResponses};
+use tkach::providers::{Anthropic, OpenAICompatible, OpenAIResponses};
 
-// Anthropic
+// Anthropic Messages API.
 let p = Anthropic::from_env();   // ANTHROPIC_API_KEY
-
-// Anthropic adaptive thinking (recommended on Claude Sonnet/Opus 4.6+)
-let p = Anthropic::from_env()
-    .with_adaptive_thinking_effort("high");
-
-// Anthropic manual thinking budget (older/fixed-budget mode)
-let p = Anthropic::from_env()
-    .with_thinking_budget(1024);
 
 // OpenAI Chat Completions-compatible API: text + tool calls, no standard thinking.
 let p = OpenAICompatible::from_env();   // OPENAI_API_KEY
 
-// OpenAI Responses API: use this for OpenAI reasoning-summary streams.
+// OpenAI Responses API — required for reasoning-summary streams.
 let p = OpenAIResponses::from_env()
     .with_reasoning("medium", "detailed");
 
@@ -128,49 +123,29 @@ let p = OpenAICompatible::new("ignored")
 
 Implementing your own provider: implement `LlmProvider` (one `complete` and one `stream` method).
 
-### OpenAI ChatGPT Codex subscription
+### Anthropic extended thinking
 
-`OpenAICodex` targets the ChatGPT subscription Codex backend at `https://chatgpt.com/backend-api/codex/responses`. Wire grammar matches `OpenAIResponses` (same SSE events: `response.output_text.delta`, atomic `function_call`, `response.reasoning_summary_text.*`), so text, tool calls, and reasoning summaries flow through the standard `StreamEvent` API.
-
-Credentials are caller-owned. The provider does **not** implement OAuth login, refresh-token exchange, environment-variable lookup, keyring storage, or account discovery — it asks a `CodexCredentialsProvider` for fresh credentials before every request and surfaces `401` to the caller without internal retry.
+`Anthropic::with_adaptive_thinking_effort` (recommended on Claude Sonnet/Opus 4.6+) lets the model decide when to think. `with_thinking_budget` is the older fixed-token mode.
 
 ```rust
-use async_trait::async_trait;
-use tkach::ProviderError;
-use tkach::providers::{CodexCredentials, CodexCredentialsProvider, OpenAICodex};
+// Adaptive thinking — recommended.
+let p = Anthropic::from_env()
+    .with_adaptive_thinking_effort("high");
 
-struct MyTokenCache { /* OAuth client, refresh logic, keyring ... */ }
-
-#[async_trait]
-impl CodexCredentialsProvider for MyTokenCache {
-    async fn credentials(&self) -> Result<CodexCredentials, ProviderError> {
-        // Call your token cache here. Refresh on expiry; surface errors otherwise.
-        Ok(CodexCredentials::new("access-token", "account-id"))
-    }
-}
-
-let provider = OpenAICodex::new(MyTokenCache { /* ... */ })
-    .with_originator("my-app")                  // optional, defaults to "tkach"
-    .with_reasoning_summary("auto")             // optional, default "auto"
-    .with_reasoning_effort("medium");           // optional, off by default
-
-// Static credentials are useful for tests and short-lived scripts:
-let provider = OpenAICodex::with_static_credentials(
-    CodexCredentials::new("token", "acct"),
-);
+// Manual budget — fixed-token mode.
+let p = Anthropic::from_env()
+    .with_thinking_budget(1024);
 ```
 
-Reasoning summary is on by default (`reasoning: { summary: "auto" }`). The Codex backend does not emit `response.reasoning_summary_text.*` events unless this is set — `include: ["reasoning.encrypted_content"]` alone gets you opaque replay state but no visible thinking text. Call `.without_reasoning()` to drop the field; the encrypted-replay include is independent and still travels.
-
-The Codex subscription backend is undocumented and unstable. Wire shape and event names can change without notice — pin a `tkach` version you have validated end-to-end if you ship this in production. See `examples/streaming_openai_codex.rs`.
+Both paths emit the same `StreamEvent::ThinkingDelta` and `StreamEvent::ThinkingBlock` events; downstream code does not branch on which mode produced them.
 
 ### Anthropic prompt caching
 
-`SystemBlock::cached`, `Content::text_cached`, and `AgentBuilder::cache_tools` mark cache breakpoints; `Usage` reports `cache_creation_input_tokens` / `cache_read_input_tokens` so callers can measure hit rate. Default TTL 5min, 1h via `CacheControl::ephemeral_1h()`. Cache reads bill at 0.1x base input; writes at 1.25x (5m) / 2x (1h). See `examples/anthropic_caching.rs` and `examples/anthropic_caching_streaming.rs`.
+`SystemBlock::cached`, `Content::text_cached`, and `AgentBuilder::cache_tools` mark cache breakpoints; `Usage` reports `cache_creation_input_tokens` / `cache_read_input_tokens` so callers can measure hit rate. Default TTL is 5 min, with 1 h available via `CacheControl::ephemeral_1h()`. Cache reads bill at 0.1× base input; writes at 1.25× (5 min) or 2× (1 h). See `examples/anthropic_caching.rs` and `examples/anthropic_caching_streaming.rs`.
 
 ### Anthropic Message Batches (50 % async)
 
-Anthropic's [Message Batches API](https://docs.anthropic.com/en/api/messages-batches) takes the same `Request` body, runs it asynchronously over up to 24h, and bills **50 % off** input + output tokens. Stack with `SystemBlock::cached_1h(...)` for ≈85 % off when prefixes are stable across batches. Right call for overnight backfills, scheduled recompute jobs, evals, or any workload that doesn't care about p99.
+Anthropic's [Message Batches API](https://docs.anthropic.com/en/api/messages-batches) takes the same `Request` body, runs it asynchronously over up to 24 h, and bills **50 % off** input + output tokens. Stack with `SystemBlock::cached_1h(...)` for ≈85 % off when prefixes are stable across batches. Right call for overnight backfills, scheduled recompute jobs, evals, or any workload that doesn't care about p99.
 
 ```rust
 use futures::StreamExt;
@@ -209,7 +184,43 @@ while let Some(item) = stream.next().await {
 }
 ```
 
-`custom_id`s are validated client-side (regex + dedup) before the HTTP call. Caller owns the polling cadence — there's no `await_batch` helper because the right interval (every 5min vs every 1h vs exp-backoff) is workload-dependent. See `examples/anthropic_batch.rs`, `examples/anthropic_batch_cancel.rs`, `examples/anthropic_batch_mixed.rs`.
+`custom_id`s are validated client-side (regex + dedup) before the HTTP call. Caller owns the polling cadence — there is no `await_batch` helper because the right interval (every 5 min vs every 1 h vs exp-backoff) is workload-dependent. See `examples/anthropic_batch.rs`, `examples/anthropic_batch_cancel.rs`, `examples/anthropic_batch_mixed.rs`.
+
+### OpenAI ChatGPT Codex subscription
+
+`OpenAICodex` targets the ChatGPT subscription Codex backend at `https://chatgpt.com/backend-api/codex/responses`. Wire grammar matches `OpenAIResponses` (same SSE events: `response.output_text.delta`, atomic `function_call`, `response.reasoning_summary_text.*`), so text, tool calls, and reasoning summaries flow through the standard `StreamEvent` API.
+
+Credentials are caller-owned. The provider does **not** implement OAuth login, refresh-token exchange, environment-variable lookup, keyring storage, or account discovery — it asks a `CodexCredentialsProvider` for fresh credentials before every request and surfaces `401` to the caller without internal retry.
+
+```rust
+use async_trait::async_trait;
+use tkach::ProviderError;
+use tkach::providers::{CodexCredentials, CodexCredentialsProvider, OpenAICodex};
+
+struct MyTokenCache { /* OAuth client, refresh logic, keyring ... */ }
+
+#[async_trait]
+impl CodexCredentialsProvider for MyTokenCache {
+    async fn credentials(&self) -> Result<CodexCredentials, ProviderError> {
+        // Call your token cache here. Refresh on expiry; surface errors otherwise.
+        Ok(CodexCredentials::new("access-token", "account-id"))
+    }
+}
+
+let provider = OpenAICodex::new(MyTokenCache { /* ... */ })
+    .with_originator("my-app")                  // optional, defaults to "tkach"
+    .with_reasoning_summary("auto")             // optional, default "auto"
+    .with_reasoning_effort("medium");           // optional, off by default
+
+// Static credentials are useful for tests and short-lived scripts:
+let provider = OpenAICodex::with_static_credentials(
+    CodexCredentials::new("token", "acct"),
+);
+```
+
+Reasoning summary is on by default (`reasoning: { summary: "auto" }`). The Codex backend does not emit `response.reasoning_summary_text.*` events unless this is set — `include: ["reasoning.encrypted_content"]` alone gets you opaque replay state but no visible thinking text. Call `.without_reasoning()` to drop the field; the encrypted-replay include is independent and still travels.
+
+The Codex subscription backend is undocumented and unstable. Wire shape and event names can change without notice — pin a `tkach` version you have validated end-to-end if you ship this in production. See `examples/streaming_openai_codex.rs`.
 
 ## Streaming
 
@@ -329,12 +340,15 @@ Each runnable demo also asserts its invariants — `cargo run --example NAME` ei
 - [`streaming_subagent.rs`](./examples/streaming_subagent.rs) — Sonnet streams, delegates to a Haiku sub-agent.
 - [`streaming_openai_tools.rs`](./examples/streaming_openai_tools.rs) — OpenAI-compatible tool call + no-thinking contract through Chat Completions.
 - [`streaming_openai_responses_thinking.rs`](./examples/streaming_openai_responses_thinking.rs) — OpenAI Responses reasoning-summary stream; asserts positive thinking blocks.
+- [`streaming_openai_codex.rs`](./examples/streaming_openai_codex.rs) — ChatGPT Codex subscription stream; reasoning summary + atomic tool calls.
 - [`streaming_cancel.rs`](./examples/streaming_cancel.rs) — Cancel mid-generation, partial text preserved.
 - [`streaming_resilience.rs`](./examples/streaming_resilience.rs) — Tool failure + cancel-during-tool + multi-block turns.
 - [`approval_flow.rs`](./examples/approval_flow.rs) — Live denial flow with custom `ApprovalHandler`.
 - [`parallel_tools.rs`](./examples/parallel_tools.rs) — Read-only tools running in parallel.
 - [`custom_tool.rs`](./examples/custom_tool.rs) — Defining your own tool.
-- [`anthropic_batch.rs`](./examples/anthropic_batch.rs) — Batch API happy path: submit → poll → stream results (50% off, 24h async).
+- [`anthropic_caching.rs`](./examples/anthropic_caching.rs) — Prompt caching: cache_creation vs cache_read on the second call.
+- [`anthropic_caching_streaming.rs`](./examples/anthropic_caching_streaming.rs) — Same shape, but through the streaming API.
+- [`anthropic_batch.rs`](./examples/anthropic_batch.rs) — Batch API happy path: submit → poll → stream results (50 % off, 24 h async).
 - [`anthropic_batch_cancel.rs`](./examples/anthropic_batch_cancel.rs) — Batch cancel-then-fetch-partial; mixed `Succeeded` and `Canceled` outcomes.
 - [`anthropic_batch_mixed.rs`](./examples/anthropic_batch_mixed.rs) — Per-row error isolation; bad request rides alongside successes as `Errored`.
 

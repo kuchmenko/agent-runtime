@@ -3,14 +3,29 @@ name: Release
 on:
   push:
     branches: [main]
+  # Recovery path: when the automatic publish below fails AFTER release-please
+  # has already cut a GH Release + tag, re-running the workflow does NOT help —
+  # release-please-action only sets release_created=true on the run that
+  # actually creates the release, so reruns skip both ci and publish.
+  #
+  # Trigger via GH UI: Actions → Release → Run workflow → tag=tkach-vX.Y.Z.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to publish to crates.io (e.g. tkach-v0.4.1). Use only when the automatic publish failed after the tag was created.'
+        required: true
 
 permissions:
   contents: write
   pull-requests: write
+  # security-events: write is required so the ci-checks reusable can upload
+  # clippy SARIF when called as the publish gate.
+  security-events: write
 
 jobs:
   release-please:
     name: Release Please
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
@@ -19,13 +34,43 @@ jobs:
       - uses: googleapis/release-please-action@v4
         id: release
 
-  verify:
-    name: Verify Release
+  ci:
+    name: CI Checks
     needs: release-please
+    if: ${{ needs.release-please.outputs.release_created }}
+    uses: ./.github/workflows/ci-checks.yml
+    permissions:
+      contents: read
+      security-events: write
+    secrets: inherit
+
+  publish:
+    name: Publish to crates.io
+    needs: [release-please, ci]
     if: ${{ needs.release-please.outputs.release_created }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test
+      # The token is a scoped, publish-update-only crates.io API token for
+      # crate `tkach`. Stored as repo secret CARGO_REGISTRY_TOKEN.
+      - name: cargo publish
+        run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-manual:
+    name: Manual republish (recovery)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      # Checks out the tag the user typed into the Run-workflow form, then
+      # publishes that exact commit. The tag has already passed CI as part
+      # of the original (failed) auto-run, so we don't re-run the suite —
+      # this path exists specifically for "publish step alone misfired".
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo publish
+        run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
