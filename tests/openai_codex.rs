@@ -359,6 +359,132 @@ async fn failed_response_event_surfaces_as_error() {
 }
 
 #[tokio::test]
+async fn missing_terminal_event_surfaces_as_error() {
+    // Backend cuts the connection cleanly mid-turn (no terminal event,
+    // no transport error). The parser must surface this as Err rather
+    // than synthesizing a successful empty Done — that would let
+    // `complete()` return `EndTurn` with no content.
+    let server = MockServer::start().await;
+
+    let sse =
+        String::new() + "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(ok_sse(sse))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAICodex::with_static_credentials(CodexCredentials::new("t", "acct"))
+        .with_base_url(server.uri());
+
+    let mut stream = provider.stream(build_request()).await.expect("stream");
+    let mut saw_error = false;
+    let mut saw_done = false;
+    while let Some(event) = stream.next().await {
+        match event {
+            Err(ProviderError::Other(msg)) if msg.contains("terminal") => saw_error = true,
+            Ok(StreamEvent::Done) => saw_done = true,
+            _ => {}
+        }
+    }
+    assert!(saw_error, "missing terminal must surface as Err");
+    assert!(!saw_done, "must not emit Done when terminal is missing");
+}
+
+#[tokio::test]
+async fn terminal_response_recovers_text_and_tool_calls() {
+    // Defensive parse: backend finalizes the turn with output content
+    // carried only in the terminal `response.completed` payload, with
+    // no prior streaming deltas. The parser must reconstruct text and
+    // tool_use rather than emitting Usage/Done over an empty body.
+    let server = MockServer::start().await;
+
+    let sse = "data: {\"type\":\"response.completed\",\"response\":{\
+        \"status\":\"completed\",\
+        \"output\":[\
+            {\"id\":\"msg_1\",\"type\":\"message\",\"content\":[\
+                {\"type\":\"output_text\",\"text\":\"final answer\"}\
+            ]},\
+            {\"id\":\"fc_1\",\"type\":\"function_call\",\
+              \"call_id\":\"call_1\",\"name\":\"bash\",\
+              \"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}\
+        ],\
+        \"usage\":{\"input_tokens\":1,\"output_tokens\":1}\
+    }}\n\n"
+        .to_string();
+
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(ok_sse(sse))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAICodex::with_static_credentials(CodexCredentials::new("t", "acct"))
+        .with_base_url(server.uri());
+
+    let mut stream = provider.stream(build_request()).await.expect("stream");
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    let mut stop = StopReason::EndTurn;
+
+    while let Some(event) = stream.next().await {
+        match event.unwrap() {
+            StreamEvent::ContentDelta(delta) => text.push_str(&delta),
+            StreamEvent::ToolUse { id, name, input } => tool_calls.push((id, name, input)),
+            StreamEvent::MessageDelta { stop_reason } => stop = stop_reason,
+            StreamEvent::Done => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(text, "final answer");
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(tool_calls[0].0, "call_1|fc_1");
+    assert_eq!(tool_calls[0].1, "bash");
+    assert_eq!(tool_calls[0].2["command"], "ls");
+    assert_eq!(stop, StopReason::ToolUse);
+}
+
+#[tokio::test]
+async fn terminal_response_does_not_double_emit_already_streamed_content() {
+    // When deltas have already streamed text, the recovery path must
+    // not duplicate it from the terminal payload.
+    let server = MockServer::start().await;
+
+    let sse = String::new()
+        + "data: {\"type\":\"response.output_text.delta\",\"delta\":\"streamed \"}\n\n"
+        + "data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n"
+        + "data: {\"type\":\"response.completed\",\"response\":{\
+            \"status\":\"completed\",\
+            \"output\":[{\"id\":\"msg_1\",\"type\":\"message\",\"content\":[\
+                {\"type\":\"output_text\",\"text\":\"streamed answer\"}\
+            ]}]\
+        }}\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(ok_sse(sse))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAICodex::with_static_credentials(CodexCredentials::new("t", "acct"))
+        .with_base_url(server.uri());
+
+    let mut stream = provider.stream(build_request()).await.expect("stream");
+    let mut text = String::new();
+    while let Some(event) = stream.next().await {
+        if let Ok(StreamEvent::ContentDelta(delta)) = event {
+            text.push_str(&delta);
+        }
+    }
+    assert_eq!(
+        text, "streamed answer",
+        "recovery must not duplicate already-streamed text"
+    );
+}
+
+#[tokio::test]
 async fn incomplete_max_tokens_maps_stop_reason() {
     let server = MockServer::start().await;
 

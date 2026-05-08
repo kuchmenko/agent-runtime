@@ -388,6 +388,7 @@ pub(super) struct ResponsesSseParser {
     emitted_tool_items: HashSet<String>,
     pending_reasoning: HashMap<ReasoningKey, PendingReasoning>,
     saw_tool_use: bool,
+    saw_text_delta: bool,
     emitted_terminal: bool,
 }
 
@@ -455,6 +456,9 @@ where
                 let event = match state.sse.next().await {
                     Some(Ok(event)) => event,
                     Some(Err(err)) => {
+                        // Surface the read failure once and stop;
+                        // re-polling would just spin on the same error.
+                        state.done = true;
                         return Some((
                             Err(ProviderError::Other(format!("SSE read error: {err}"))),
                             state,
@@ -524,12 +528,13 @@ impl ResponsesSseParser {
     }
 
     fn output_text_delta(
-        &self,
+        &mut self,
         value: &Value,
         out: &mut VecDeque<Result<StreamEvent, ProviderError>>,
     ) {
         if let Some(delta) = value.get("delta").and_then(Value::as_str) {
             if !delta.is_empty() {
+                self.saw_text_delta = true;
                 out.push_back(Ok(StreamEvent::ContentDelta(delta.to_string())));
             }
         }
@@ -646,6 +651,7 @@ impl ResponsesSseParser {
         if let Some(response) = value.get("response") {
             self.usage = usage_from_response(response.get("usage"));
             self.capture_reasoning_from_response(response, out);
+            self.recover_terminal_output(response, out);
             let status = response.get("status").and_then(Value::as_str);
             let incomplete_reason = response
                 .pointer("/incomplete_details/reason")
@@ -653,6 +659,66 @@ impl ResponsesSseParser {
             self.emit_terminal(status, incomplete_reason, out);
         } else {
             self.emit_terminal(None, None, out);
+        }
+    }
+
+    /// Recover output items that were never emitted via incremental
+    /// streaming events. The well-formed Codex/Responses path streams
+    /// every text delta and `output_item.done`; this is a defense
+    /// against backends that finalize a turn with content carried only
+    /// in the terminal `response.output` array.
+    fn recover_terminal_output(
+        &mut self,
+        response: &Value,
+        out: &mut VecDeque<Result<StreamEvent, ProviderError>>,
+    ) {
+        let Some(output) = response.get("output").and_then(Value::as_array) else {
+            return;
+        };
+        for item in output {
+            match item.get("type").and_then(Value::as_str) {
+                Some("function_call") => self.recover_function_call(item, out),
+                Some("message") if !self.saw_text_delta => self.recover_message_text(item, out),
+                _ => {}
+            }
+        }
+    }
+
+    fn recover_function_call(
+        &mut self,
+        item: &Value,
+        out: &mut VecDeque<Result<StreamEvent, ProviderError>>,
+    ) {
+        let item_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !item_id.is_empty() && self.emitted_tool_items.contains(&item_id) {
+            return;
+        }
+        if let Some(tool) = tool_call_from_item(item) {
+            self.emit_tool_use(tool, out);
+        }
+    }
+
+    fn recover_message_text(
+        &mut self,
+        item: &Value,
+        out: &mut VecDeque<Result<StreamEvent, ProviderError>>,
+    ) {
+        let Some(parts) = item.get("content").and_then(Value::as_array) else {
+            return;
+        };
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) == Some("output_text") {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        self.saw_text_delta = true;
+                        out.push_back(Ok(StreamEvent::ContentDelta(text.to_string())));
+                    }
+                }
+            }
         }
     }
 
@@ -864,8 +930,20 @@ impl ResponsesSseParser {
         self.emitted_terminal = true;
     }
 
+    /// Called when the SSE body ends. A terminal event
+    /// (`response.completed` / `response.incomplete` / `response.failed`)
+    /// is mandatory — its absence means the connection dropped or the
+    /// backend cut us off mid-turn. Surface that as an error rather
+    /// than synthesizing a clean `Done`, which would let truncated
+    /// streams masquerade as successful empty turns.
     fn finish(&mut self, out: &mut VecDeque<Result<StreamEvent, ProviderError>>) {
-        self.emit_terminal(None, None, out);
+        if self.emitted_terminal {
+            return;
+        }
+        out.push_back(Err(ProviderError::Other(
+            "Responses stream ended before a terminal event".into(),
+        )));
+        self.emitted_terminal = true;
     }
 }
 
