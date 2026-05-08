@@ -62,21 +62,51 @@ async fn main() -> anyhow::Result<()> {
                                           │
                        ┌──────────────────┴────────────┐
                        ▼                               ▼
-                ┌────────────┐                 ┌───────────────────┐
-                │  Provider  │                 │   ToolExecutor    │
-                │            │                 │ ┌───────────────┐ │
-                │ Anthropic  │                 │ │  ToolPolicy   │ │
-                │ OpenAI     │                 │ ├───────────────┤ │
-                │ Responses/ │                 │ │ApprovalHandler│ │
-                │ Codex/     │                 │ ├───────────────┤ │
-                │ compatible │                 │ │ ToolRegistry  │ │
-                │ Mock       │                 │ └───────────────┘ │
-                └────────────┘                 └─────────┬─────────┘
-                                                         │
-                                              read-only batches in
-                                              parallel via join_all,
-                                              mutating sequentially
+                ┌────────────────────┐          ┌───────────────────┐
+                │   LlmProvider      │          │   ToolExecutor    │
+                │                    │          │ ┌───────────────┐ │
+                │ Anthropic          │          │ │  ToolPolicy   │ │
+                │ OpenAIResponses    │          │ ├───────────────┤ │
+                │ OpenAICodex        │          │ │ApprovalHandler│ │
+                │ OpenAICompatible   │          │ ├───────────────┤ │
+                │ Mock               │          │ │ ToolRegistry  │ │
+                └────────────────────┘          │ └───────────────┘ │
+                                                └─────────┬─────────┘
+                                                          │
+                                              ┌───────────┴────────────┐
+                                              ▼                        ▼
+                                        ReadOnly: parallel       Mutating: sequential
+                                        Read · Glob · Grep ·     Write · Edit · Bash ·
+                                        WebFetch                 SubAgent
 ```
+
+The diagram glosses over a few invariants worth knowing up front:
+
+- **Stateless turn loop.** `Agent::run` walks turn-by-turn until the model
+  stops emitting `ToolUse` or `max_turns` is reached. Each turn is one
+  `LlmProvider` call and one `ToolExecutor::execute_batch` against the
+  resulting `ToolUse` block. The caller appends `result.new_messages`
+  to its own history for the next call — the runtime keeps no per-call
+  state, so resume / fork / retry are just calls with different histories.
+- **Atomic streaming.** `Agent::stream` accumulates `input_json_delta`
+  chunks before emitting `ToolUse`, so consumers never see partial JSON.
+  `ToolCallPending` fires after `ToolUse` and before the approval gate,
+  so UIs can render an "approval pending" state independently of the
+  tool actually running.
+- **One cancellation surface.** A single `CancellationToken` reaches the
+  agent loop, the SSE pull, the in-flight HTTP body, every
+  `ApprovalHandler::approve` call, every `Bash` child via `kill_on_drop`,
+  and every `WebFetch`. `cancel.cancel()` shuts everything down within
+  milliseconds and the loop drops out cleanly.
+- **Sub-agents inherit the executor.** `SubAgent::execute` constructs a
+  nested agent loop using the parent's `ToolExecutor` (carried in
+  `ToolContext`), so one `ApprovalHandler` and one `ToolPolicy` gate
+  the whole agent tree — no explicit re-plumbing across recursion depth.
+- **Read-only parallelism, mutating serialization.** A `ToolUse` batch
+  is partitioned by `ToolClass`: `ReadOnly` tools (Read, Glob, Grep,
+  WebFetch and any custom tool that overrides `class()` to `ReadOnly`)
+  run via `join_all`; everything else runs sequentially in the order
+  the model emitted them.
 
 ## Built-in tools
 
