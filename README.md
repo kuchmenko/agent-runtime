@@ -150,13 +150,17 @@ impl CodexCredentialsProvider for MyTokenCache {
 }
 
 let provider = OpenAICodex::new(MyTokenCache { /* ... */ })
-    .with_originator("my-app");                // optional, defaults to "tkach"
+    .with_originator("my-app")                  // optional, defaults to "tkach"
+    .with_reasoning_summary("auto")             // optional, default "auto"
+    .with_reasoning_effort("medium");           // optional, off by default
 
 // Static credentials are useful for tests and short-lived scripts:
 let provider = OpenAICodex::with_static_credentials(
     CodexCredentials::new("token", "acct"),
 );
 ```
+
+Reasoning summary is on by default (`reasoning: { summary: "auto" }`). The Codex backend does not emit `response.reasoning_summary_text.*` events unless this is set — `include: ["reasoning.encrypted_content"]` alone gets you opaque replay state but no visible thinking text. Call `.without_reasoning()` to drop the field; the encrypted-replay include is independent and still travels.
 
 The Codex subscription backend is undocumented and unstable. Wire shape and event names can change without notice — pin a `tkach` version you have validated end-to-end if you ship this in production. See `examples/streaming_openai_codex.rs`.
 

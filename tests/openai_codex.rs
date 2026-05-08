@@ -82,8 +82,67 @@ async fn stream_sends_codex_headers_and_body_shape() {
     assert_eq!(body["stream"], true);
     assert_eq!(body["text"]["verbosity"], "low");
     assert_eq!(body["include"][0], "reasoning.encrypted_content");
+    assert_eq!(
+        body["reasoning"]["summary"], "auto",
+        "include=encrypted_content alone does not enable summary events; reasoning.summary must be set"
+    );
     assert!(body.get("max_output_tokens").is_none());
     assert_eq!(body["tools"][0]["name"], "bash");
+}
+
+#[tokio::test]
+async fn reasoning_effort_and_summary_overrides_apply() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(ok_sse(
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+                .into(),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider = OpenAICodex::with_static_credentials(CodexCredentials::new("t", "acct"))
+        .with_base_url(server.uri())
+        .with_reasoning_effort("high")
+        .with_reasoning_summary("detailed");
+
+    let mut stream = provider.stream(build_request()).await.expect("stream");
+    while stream.next().await.is_some() {}
+
+    let received = &server.received_requests().await.unwrap()[0];
+    let body: Value = serde_json::from_slice(&received.body).unwrap();
+    assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["reasoning"]["summary"], "detailed");
+}
+
+#[tokio::test]
+async fn without_reasoning_omits_field_but_keeps_include() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(ok_sse(
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+                .into(),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider = OpenAICodex::with_static_credentials(CodexCredentials::new("t", "acct"))
+        .with_base_url(server.uri())
+        .without_reasoning();
+
+    let mut stream = provider.stream(build_request()).await.expect("stream");
+    while stream.next().await.is_some() {}
+
+    let received = &server.received_requests().await.unwrap()[0];
+    let body: Value = serde_json::from_slice(&received.body).unwrap();
+    assert!(body.get("reasoning").is_none());
+    assert_eq!(body["include"][0], "reasoning.encrypted_content");
 }
 
 #[tokio::test]

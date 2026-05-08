@@ -44,6 +44,7 @@ use crate::stream::{ProviderEventStream, StreamEvent};
 
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const DEFAULT_ORIGINATOR: &str = "tkach";
+const DEFAULT_REASONING_SUMMARY: &str = "auto";
 
 /// Bearer credentials for the ChatGPT subscription Codex backend.
 ///
@@ -115,6 +116,8 @@ pub struct OpenAICodex {
     client: reqwest::Client,
     base_url: String,
     originator: String,
+    reasoning_effort: Option<String>,
+    reasoning_summary: Option<String>,
 }
 
 impl OpenAICodex {
@@ -128,6 +131,8 @@ impl OpenAICodex {
             client: reqwest::Client::new(),
             base_url: DEFAULT_BASE_URL.to_string(),
             originator: DEFAULT_ORIGINATOR.to_string(),
+            reasoning_effort: None,
+            reasoning_summary: Some(DEFAULT_REASONING_SUMMARY.to_string()),
         }
     }
 
@@ -153,12 +158,46 @@ impl OpenAICodex {
         self
     }
 
+    /// Override the `reasoning.summary` field sent on every request.
+    /// Default `"auto"`.
+    ///
+    /// The Codex backend does not emit `response.reasoning_summary_text.*`
+    /// events unless `reasoning.summary` is set on the request.
+    /// `include: ["reasoning.encrypted_content"]` alone gets you opaque
+    /// replay state but no visible thinking text. Common values:
+    /// `auto`, `concise`, `detailed`. OpenAI validates the exact set.
+    pub fn with_reasoning_summary(mut self, summary: impl Into<String>) -> Self {
+        self.reasoning_summary = Some(summary.into());
+        self
+    }
+
+    /// Set `reasoning.effort` (Codex/Responses-style models). Typical
+    /// values: `low`, `medium`, `high`. Off by default — the backend
+    /// picks its own effort budget when this is unset.
+    pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Self {
+        self.reasoning_effort = Some(effort.into());
+        self
+    }
+
+    /// Stop sending `reasoning` on requests. The backend will not emit
+    /// reasoning summary events; `include: ["reasoning.encrypted_content"]`
+    /// still goes through, so opaque replay state continues to work.
+    pub fn without_reasoning(mut self) -> Self {
+        self.reasoning_effort = None;
+        self.reasoning_summary = None;
+        self
+    }
+
     fn responses_url(&self) -> String {
         format!("{}/codex/responses", self.base_url.trim_end_matches('/'))
     }
 
     async fn send(&self, request: &Request) -> Result<reqwest::Response, ProviderError> {
-        let body = build_request_body(request);
+        let body = build_request_body(
+            request,
+            self.reasoning_effort.as_deref(),
+            self.reasoning_summary.as_deref(),
+        );
         let credentials = self.credentials.credentials().await?;
 
         let response = self
@@ -255,7 +294,11 @@ fn flush_text(buf: &mut String, content: &mut Vec<Content>) {
     }
 }
 
-fn build_request_body(request: &Request) -> Value {
+fn build_request_body(
+    request: &Request,
+    reasoning_effort: Option<&str>,
+    reasoning_summary: Option<&str>,
+) -> Value {
     let mut body = json!({
         "model": request.model,
         "store": false,
@@ -270,6 +313,17 @@ fn build_request_body(request: &Request) -> Value {
     }
     if let Some(temperature) = request.temperature {
         body["temperature"] = json!(temperature);
+    }
+
+    if reasoning_effort.is_some() || reasoning_summary.is_some() {
+        let mut reasoning = serde_json::Map::new();
+        if let Some(effort) = reasoning_effort {
+            reasoning.insert("effort".into(), json!(effort));
+        }
+        if let Some(summary) = reasoning_summary {
+            reasoning.insert("summary".into(), json!(summary));
+        }
+        body["reasoning"] = Value::Object(reasoning);
     }
 
     let tools = proto::build_tools(&request.tools);
@@ -306,7 +360,7 @@ mod tests {
 
     #[test]
     fn body_uses_codex_envelope() {
-        let body = build_request_body(&sample_request());
+        let body = build_request_body(&sample_request(), None, Some("auto"));
 
         assert_eq!(body["model"], "gpt-5-codex");
         assert_eq!(body["store"], false);
@@ -327,10 +381,53 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_summary_default_is_auto() {
+        let provider = OpenAICodex::with_static_credentials(CodexCredentials::new("t", "acct"));
+        assert_eq!(provider.reasoning_summary.as_deref(), Some("auto"));
+        assert!(provider.reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn body_emits_reasoning_summary_for_responses_api() {
+        // Reproduces the bug Sunny found in real Codex traffic:
+        // include=encrypted_content alone is not enough — the backend
+        // only emits response.reasoning_summary_text.* when
+        // reasoning.summary is set on the request.
+        let body = build_request_body(&sample_request(), None, Some("auto"));
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert!(body["reasoning"].get("effort").is_none());
+    }
+
+    #[test]
+    fn body_emits_both_effort_and_summary_when_set() {
+        let body = build_request_body(&sample_request(), Some("medium"), Some("detailed"));
+        assert_eq!(body["reasoning"]["effort"], "medium");
+        assert_eq!(body["reasoning"]["summary"], "detailed");
+    }
+
+    #[test]
+    fn body_omits_reasoning_when_disabled() {
+        let body = build_request_body(&sample_request(), None, None);
+        assert!(body.get("reasoning").is_none());
+        // include is independent of reasoning — encrypted replay state
+        // still travels even when summary is disabled.
+        assert_eq!(body["include"][0], "reasoning.encrypted_content");
+    }
+
+    #[test]
+    fn without_reasoning_clears_both_fields() {
+        let provider = OpenAICodex::with_static_credentials(CodexCredentials::new("t", "acct"))
+            .with_reasoning_effort("high")
+            .without_reasoning();
+        assert!(provider.reasoning_effort.is_none());
+        assert!(provider.reasoning_summary.is_none());
+    }
+
+    #[test]
     fn body_omits_tools_when_none() {
         let mut req = sample_request();
         req.tools.clear();
-        let body = build_request_body(&req);
+        let body = build_request_body(&req, None, Some("auto"));
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
         assert!(body.get("parallel_tool_calls").is_none());
@@ -401,7 +498,7 @@ mod tests {
             temperature: None,
         };
 
-        let body = build_request_body(&req);
+        let body = build_request_body(&req, None, Some("auto"));
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[0]["type"], "function_call");
         assert_eq!(input[0]["call_id"], "call_1");
