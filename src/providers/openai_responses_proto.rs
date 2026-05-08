@@ -139,12 +139,13 @@ fn push_assistant_message(input: &mut Vec<Value>, message: &Message) {
                 text.clear();
 
                 let (call_id, item_id) = split_tool_use_id(id);
+                // `status` is output-only on the Responses API. Sending
+                // it on input items returns an error from the backend.
                 let mut item = json!({
                     "type": "function_call",
                     "call_id": call_id,
                     "name": name,
                     "arguments": args.to_string(),
-                    "status": "completed",
                 });
                 if let Some(item_id) = item_id {
                     item["id"] = json!(item_id);
@@ -163,10 +164,11 @@ fn openai_reasoning_input(
     text: &str,
     encrypted_content: Option<&str>,
 ) -> Value {
+    // `status` is output-only on the Responses API. Sending it on
+    // input reasoning items returns an error from the backend.
     let mut item = json!({
         "type": "reasoning",
         "summary": [{"type": "summary_text", "text": text}],
-        "status": "completed",
     });
     if let Some(item_id) = item_id {
         item["id"] = json!(item_id);

@@ -264,6 +264,11 @@ mod tests {
         assert_eq!(input[1]["id"], "fc_1");
         assert_eq!(input[2]["type"], "function_call_output");
         assert_eq!(input[2]["call_id"], "call_1");
+
+        // status is output-only on the Responses API; including it on
+        // input items causes the backend to reject the request.
+        assert!(input[0].get("status").is_none());
+        assert!(input[1].get("status").is_none());
     }
 
     #[test]
