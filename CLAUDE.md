@@ -21,7 +21,7 @@ Single crate with modules:
 - `message` — Message, Content, Role, StopReason, Usage
 - `error` — AgentError, ProviderError, ToolError
 - `tools/` — Built-in tools: Read, Write, Edit, Glob, Grep, Bash, SubAgent, WebFetch
-- `providers/` — Anthropic, OpenAICompatible, Mock
+- `providers/` — Anthropic, OpenAICompatible, OpenAIResponses, OpenAICodex, Mock
 
 ## Commands
 
@@ -32,19 +32,23 @@ Single crate with modules:
 ## Commits
 
 Use [Conventional Commits](https://www.conventionalcommits.org/):
-- `feat:` — new feature (bumps minor)
+- `feat:` — new feature (bumps **patch** pre-1.0; minor post-1.0)
 - `fix:` — bug fix (bumps patch)
-- `feat!:` or `fix!:` — breaking change (bumps minor pre-1.0)
-- `chore:`, `docs:`, `refactor:`, `test:` — no release
+- `feat!:` or `fix!:` — breaking change (bumps minor pre-1.0; major post-1.0)
+- `chore:`, `docs:`, `refactor:`, `test:`, `ci:` — no release
+
+Pre-1.0 bumping is governed by `release-please-config.json` flags
+`bump-minor-pre-major: true` and `bump-patch-for-minor-pre-major: true`.
+The result: only breaking commits cut a new minor; everything else rides patches.
 
 ## Release process
 
 Automated via [release-please](https://github.com/googleapis/release-please).
 See `RELEASING.md` for details.
 
-**Flow:** conventional commits on `main` → release-please creates Release PR → merge PR → GitHub Release + tag created automatically.
+**Flow:** conventional commits on `main` → release-please creates Release PR → merge PR → GitHub Release + tag → CI suite re-runs against the tagged commit → `cargo publish` to crates.io. All automatic.
 
-**Do NOT** manually edit `CHANGELOG.md` or bump version — release-please handles both.
+**Do NOT** manually edit `CHANGELOG.md`, bump version, or run `cargo publish` — release-please + the publish workflow handle all three.
 
 **When to suggest merging the Release PR:**
 - When meaningful features or fixes have accumulated
