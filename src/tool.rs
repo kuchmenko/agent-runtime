@@ -140,10 +140,20 @@ pub trait Tool: Send + Sync {
     /// contention while still bounding it by the
     /// `max_concurrent_mutations` cap of the *current* level.
     ///
-    /// Defaults to `false`. Override to `true` only for tools whose
-    /// `execute` body invokes `ctx.executor` recursively (directly
-    /// or via an `Agent` it constructs from
-    /// `ctx.executor.fork_for_subagent()`).
+    /// Defaults to `false`. Override to `true` for tools whose
+    /// `execute` body drives nested executor work.
+    ///
+    /// When you override this, the recursive call site **must** run
+    /// against an executor obtained from
+    /// `ctx.executor.fork_for_subagent()` — not directly against
+    /// `ctx.executor`. The fork is what gives the nested level its
+    /// own `concurrent_mut` and per-tool semaphores; without it, a
+    /// parent saturating those pools would deadlock the moment any
+    /// child tried to acquire a permit from the same shared
+    /// semaphore. The canonical pattern is to construct an
+    /// `Agent::builder().executor(ctx.executor.fork_for_subagent())`
+    /// and `agent.run(...)` from inside `execute`; `SubAgent`
+    /// implements exactly this shape.
     fn is_recursive(&self) -> bool {
         false
     }

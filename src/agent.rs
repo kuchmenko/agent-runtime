@@ -862,7 +862,20 @@ impl AgentBuilder {
     /// sub-agent spawning, where the child inherits the parent's full
     /// registry automatically.
     ///
-    /// When set, `.tool()`, `.tools()`, and `.policy()` are ignored.
+    /// When set, the override carries its own registry, policy, approval
+    /// handler, AND [`ConcurrencyConfig`] — so the following builder
+    /// methods are silently ignored at [`Self::build`]:
+    ///
+    /// - [`Self::tool`], [`Self::tools`]
+    /// - [`Self::policy`]
+    /// - [`Self::approval`]
+    /// - [`Self::max_concurrent_reads`], [`Self::max_concurrent_mutations`]
+    /// - [`Self::tool_concurrency`], [`Self::tool_concurrencies`]
+    ///
+    /// To customise concurrency for a sub-agent, build a forked executor
+    /// via [`ToolExecutor::fork_for_subagent`] (or construct one directly
+    /// with [`ToolExecutor::with_approval_and_concurrency`]) and pass it
+    /// here.
     pub fn executor(mut self, executor: Arc<ToolExecutor>) -> Self {
         self.executor_override = Some(executor);
         self
@@ -914,18 +927,40 @@ impl AgentBuilder {
         self
     }
 
-    /// Maximum concurrent `Mutating`-class tool calls that have been
-    /// promoted via [`Self::tool_concurrency`] with
-    /// [`ToolConcurrency::on`]. Tools without an explicit promotion
-    /// continue to serialise globally regardless of this value (they
-    /// share a separate width-1 semaphore). Default: 10.
+    /// Maximum concurrent `Mutating`-class tool calls that share the
+    /// `concurrent_mut` pool. Default: 10.
     ///
-    /// Sub-agents share the parent's `ToolExecutor` and therefore the
-    /// parent's mutator pool — the cap applies across the entire agent
-    /// tree. With a 3-level deep tree fanning out 5 sub-agents per
-    /// level and `max_concurrent_mutations(10)`, leaf calls can sit
-    /// waiting for permits held elsewhere in the tree. This is
-    /// intended behaviour — global admission control.
+    /// Two paths admit a call into this pool:
+    ///
+    /// 1. The consumer promotes a default-`Mutating` tool via
+    ///    [`Self::tool_concurrency`] with [`ToolConcurrency::on`].
+    /// 2. The tool sets [`crate::Tool::is_recursive`] to `true` (the
+    ///    canonical example is `SubAgent`). Recursive tools are routed
+    ///    through `concurrent_mut` regardless of explicit promotion to
+    ///    avoid the permit-held-during-nested-execute deadlock that
+    ///    would otherwise arise on the shared `serial_mut` pool.
+    ///
+    /// **Scope of the cap is per nesting level**, not tree-wide.
+    /// `SubAgent::execute` calls [`ToolExecutor::fork_for_subagent`],
+    /// which forks a fresh `concurrent_mut` semaphore (same numeric
+    /// cap, independent permit accounting) so a parent saturating its
+    /// pool cannot deadlock children needing their own
+    /// promoted-mutator slots. Total in-flight promoted calls in a
+    /// deep tree therefore scale as `O(fanout^depth × cap)` — capacity-
+    /// plan accordingly when promoting tools that hit shared external
+    /// resources (rate-limited APIs, finite connection pools).
+    ///
+    /// `serial_mut` (cap 1, fixed) and `read` (default cap 20) stay
+    /// **shared** across the agent tree:
+    ///
+    /// - Default-`Mutating` tools without an explicit promotion still
+    ///   serialise globally — two sibling sub-agents writing the same
+    ///   file via the built-in `write` tool will not race even when
+    ///   the consumer opted into none of the concurrency knobs.
+    /// - The read pool acts as a global throughput throttle.
+    ///
+    /// See [`crate::ConcurrencyConfig::fork`] for the exact share-vs-
+    /// fork policy.
     ///
     /// Ignored when [`Self::executor`] was called.
     ///
@@ -951,6 +986,14 @@ impl AgentBuilder {
     /// with conflicting inputs (e.g. two writes to the same path).
     /// Promote only when the LLM-emitted batch shape — and the tool's
     /// own resource semantics — make racing safe.
+    ///
+    /// **Per-tool caps fork per nesting level**: a sub-agent inherits
+    /// the configured cap as a fresh semaphore via
+    /// [`ToolExecutor::fork_for_subagent`]. A `.max(2)` cap therefore
+    /// admits 2 concurrent calls *per nesting level*, not 2 tree-wide.
+    /// Plan caps with this in mind for tools that hit shared external
+    /// resources (rate-limited APIs, finite connection pools); see
+    /// [`crate::ConcurrencyConfig::fork`].
     ///
     /// Later calls for the same tool name override earlier ones.
     /// Ignored when [`Self::executor`] was called.
