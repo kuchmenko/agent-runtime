@@ -107,6 +107,18 @@ impl Tool for SubAgent {
         })
     }
 
+    /// `SubAgent` is the canonical recursive tool — its `execute` body
+    /// runs an entire nested `Agent::run` while the executor task that
+    /// dispatched it stays parked. The executor uses this signal to
+    /// route the call through the per-level-forked `concurrent_mut`
+    /// pool even when the consumer hasn't explicitly promoted `agent`
+    /// via `tool_concurrency`, avoiding the permanent stall that
+    /// would otherwise arise from holding a shared `serial_mut`
+    /// permit across the child's lifetime.
+    fn is_recursive(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         if ctx.depth >= ctx.max_depth {
             return Ok(ToolOutput::error(format!(
@@ -122,10 +134,18 @@ impl Tool for SubAgent {
         let system_override = input["system"].as_str().map(String::from);
         let system = system_override.or_else(|| self.system.clone());
 
+        // Fork the executor so the sub-agent runs with fresh
+        // concurrency-permit accounting. Same registry, policy, and
+        // approval — but independent semaphores. Without this fork,
+        // a parent batch saturating `concurrent_mut` with promoted
+        // `agent` calls would deadlock as soon as any child needed
+        // its own promoted-mutator slot.
+        let child_executor = ctx.executor.fork_for_subagent();
+
         let mut builder = Agent::builder()
             .provider_arc(Arc::clone(&self.provider))
             .model(&*self.model)
-            .executor(Arc::clone(&ctx.executor))
+            .executor(child_executor)
             .max_turns(self.max_turns)
             .max_tokens(self.max_tokens)
             .working_dir(&ctx.working_dir)
