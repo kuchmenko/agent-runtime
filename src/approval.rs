@@ -40,6 +40,22 @@
 //! `ctx.cancel.cancelled()`. If the caller cancels while the handler
 //! is awaiting a user click, the executor short-circuits with a
 //! cancelled tool_result rather than waiting forever.
+//!
+//! ## Concurrent invocation
+//!
+//! When the consumer opts a tool into the concurrent-mutator pool via
+//! [`crate::AgentBuilder::tool_concurrency`], a single LLM batch may
+//! produce multiple promoted-mutator calls executing in parallel.
+//! Each task invokes `approve()` independently, so an
+//! [`ApprovalHandler`] implementation may be called from several
+//! tasks at once. The trait already requires `Send + Sync`, so type
+//! safety is unconditional. UI-bound implementations (TUI modal, web
+//! confirmation dialog, etc.) should serialise their UI access
+//! internally — typically by funnelling all incoming
+//! `PendingDecision`s through a single `mpsc::channel` into the UI
+//! thread, which the example pattern below already shows. Stateless
+//! handlers (such as [`AutoApprove`] or any pure-policy decision
+//! function) are concurrent-safe out of the box.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -68,6 +84,13 @@ pub enum ApprovalDecision {
 ///
 /// The `class` parameter is provided so handlers can fast-path
 /// read-only tools without bothering the user.
+///
+/// Concurrent invocation: when the consumer enables concurrent
+/// mutators via [`crate::AgentBuilder::tool_concurrency`], `approve`
+/// may be called from several executor tasks at once. UI-bound
+/// implementations should serialise their UI access internally; see
+/// the module-level "Concurrent invocation" section for the
+/// recommended `mpsc`-into-the-UI-thread pattern.
 #[async_trait]
 pub trait ApprovalHandler: Send + Sync {
     async fn approve(&self, tool_name: &str, input: &Value, class: ToolClass) -> ApprovalDecision;

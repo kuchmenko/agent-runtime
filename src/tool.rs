@@ -124,6 +124,30 @@ pub trait Tool: Send + Sync {
         ToolClass::Mutating
     }
 
+    /// Whether this tool itself drives nested executor work — i.e.
+    /// the tool's `execute` body holds the executor task open while
+    /// running another `Agent::run` underneath. The canonical example
+    /// is `SubAgent`.
+    ///
+    /// The executor uses this to admit recursive tools through the
+    /// concurrent-mutator pool *regardless of explicit promotion*,
+    /// because non-recursive admission classes (the width-1
+    /// `serial_mut` pool, in particular) are shared across the
+    /// agent tree and would deadlock when a parent's permit is
+    /// pinned during the child's nested `execute`. Routing recursive
+    /// tools through `concurrent_mut` — which the executor forks
+    /// per nesting level — keeps nested fan-out free of pool
+    /// contention while still bounding it by the
+    /// `max_concurrent_mutations` cap of the *current* level.
+    ///
+    /// Defaults to `false`. Override to `true` only for tools whose
+    /// `execute` body invokes `ctx.executor` recursively (directly
+    /// or via an `Agent` it constructs from
+    /// `ctx.executor.fork_for_subagent()`).
+    fn is_recursive(&self) -> bool {
+        false
+    }
+
     /// Execute the tool with the given input.
     async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
 }
