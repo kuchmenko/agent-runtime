@@ -44,7 +44,9 @@ pub mod tools;
 pub use agent::{Agent, AgentBuilder, AgentResult, AgentStream};
 pub use approval::{ApprovalDecision, ApprovalHandler, AutoApprove};
 pub use error::{AgentError, ProviderError, ToolError};
-pub use executor::{AllowAll, ToolCall, ToolExecutor, ToolPolicy, ToolRegistry};
+pub use executor::{
+    AllowAll, ConcurrencyConfig, ToolCall, ToolConcurrency, ToolExecutor, ToolPolicy, ToolRegistry,
+};
 pub use message::{
     CacheControl, CacheTtl, Content, Message, Role, StopReason, ThinkingMetadata, ThinkingProvider,
     Usage,
