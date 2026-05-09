@@ -2,14 +2,32 @@
 //!
 //! Three custom tools are registered:
 //! - `fetch_a`, `fetch_b` — `ReadOnly`, each sleeps 200ms
-//! - `save`            — `Mutating` (default)
+//! - `save`              — `Mutating` (default)
 //!
-//! The mock provider asks the agent to call all three in one turn, in
-//! the order `[fetch_a, save, fetch_b]`. The executor partitions the
-//! batch into `[RO] [Mut] [RO]` — two RO runs of size 1, each run
-//! degenerate to sequential. Then the mock asks for `[fetch_a, fetch_b]`
-//! in the next turn: both are RO and consecutive, so they execute in
-//! parallel via `join_all` and wall-time is ~200ms instead of ~400ms.
+//! Concurrency model: `execute_batch` partitions a batch into
+//! contiguous runs of the same routing class and dispatches each run
+//! concurrently via `FuturesUnordered`. Runs are awaited
+//! sequentially so the LLM-emitted order across class boundaries is
+//! preserved — important when a `ReadOnly` after a `Mutating` would
+//! otherwise race the side effect.
+//!
+//! Turn 1: mock emits `[fetch_a, save, fetch_b]` — three partitioned
+//! runs. Run 1 (`fetch_a`, RO) ≈ 200ms, then Run 2 (`save`, default
+//! Mutating, width-1 serial pool) ≈ 0ms, then Run 3 (`fetch_b`, RO)
+//! ≈ 200ms — total ≈ 400ms.
+//!
+//! Turn 2: mock emits `[fetch_a, fetch_b]` — one RO run, both share
+//! the `read` pool; wall-time ≈ 200ms.
+//!
+//! Total wall time ≈ 600ms (vs ≈ 800ms strictly serial). To make
+//! sibling mutators overlap (e.g. writes to independent files,
+//! multiple sub-agent fan-out), see the `parallel_writes` and
+//! `parallel_subagents` examples — they show the
+//! `tool_concurrency(name, ToolConcurrency::on())` opt-in. SubAgent
+//! is special: it overrides `is_recursive() -> true` so the executor
+//! routes it through the concurrent-mutator pool by default,
+//! avoiding the held-permit-during-nested-execute deadlock that
+//! shared `serial_mut` would otherwise create.
 //!
 //! Run with: `cargo run --example parallel_tools`
 
@@ -133,8 +151,8 @@ async fn main() {
     println!("delta messages: {}", result.new_messages.len());
     println!("wall time: {elapsed:?}");
     println!();
-    println!("Turn 1 batch [RO, Mut, RO] = 3 serial runs ≈ 400ms+");
-    println!("Turn 2 batch [RO, RO]      = 1 parallel run ≈ 200ms");
+    println!("Turn 1 batch [RO, Mut, RO] — 3 partitioned runs ≈ 400ms");
+    println!("Turn 2 batch [RO, RO]      — 1 RO run, both parallel ≈ 200ms");
     println!("Total: ~600ms (vs. ~800ms if everything were sequential)");
 }
 
