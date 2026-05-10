@@ -237,14 +237,20 @@ impl Tool for SubAgent {
             builder = builder.thinking(thinking);
         }
         if self.filter_tool_definitions {
-            if let Some(allow) = &self.tools_allow {
-                let visible = allow
-                    .iter()
-                    .filter(|name| parent_policy.is_allowed(name))
-                    .cloned()
-                    .collect();
-                builder = builder.tool_definition_filter(visible);
-            }
+            let visible = ctx
+                .executor
+                .registry()
+                .iter()
+                .map(|tool| tool.name())
+                .filter(|name| parent_policy.is_allowed(name))
+                .filter(|name| {
+                    self.tools_allow
+                        .as_ref()
+                        .is_none_or(|allow| allow.contains(*name))
+                })
+                .map(ToString::to_string)
+                .collect();
+            builder = builder.tool_definition_filter(visible);
         }
 
         let agent = match builder.build() {

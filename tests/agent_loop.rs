@@ -1220,7 +1220,65 @@ async fn subagent_trace_hook_panic_does_not_fail_parent() {
 }
 
 #[tokio::test]
-async fn subagent_filtered_tool_definitions_respect_parent_policy() {
+async fn subagent_filtered_tool_definitions_respect_parent_policy_without_child_allow_list() {
+    let parent_turn = Arc::new(AtomicUsize::new(0));
+    let parent_turn_clone = Arc::clone(&parent_turn);
+
+    let parent = Mock::new(move |_| {
+        let turn = parent_turn_clone.fetch_add(1, Ordering::SeqCst);
+        if turn == 0 {
+            Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "sub-1".into(),
+                    name: "agent".into(),
+                    input: json!({"prompt": "inspect visible tools"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+        } else {
+            Ok(Response {
+                content: vec![Content::text("parent done")],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    });
+
+    let child = Arc::new(Mock::new(|req| {
+        let names = req
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["agent", "read"]);
+        Ok(Response {
+            content: vec![Content::text("child done")],
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        })
+    }));
+
+    let agent = Agent::builder()
+        .provider(parent)
+        .model("parent")
+        .tools(tkach::tools::defaults())
+        .tool(tkach::tools::SubAgent::new(child, "child").filter_tool_definitions(true))
+        .policy(tkach::AllowList::new(["agent", "read"]))
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let result = agent
+        .run(prompt("delegate"), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(result.text, "parent done");
+}
+
+#[tokio::test]
+async fn subagent_filtered_tool_definitions_respect_parent_policy_with_child_allow_list() {
     let parent_turn = Arc::new(AtomicUsize::new(0));
     let parent_turn_clone = Arc::clone(&parent_turn);
 

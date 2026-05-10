@@ -12,7 +12,7 @@ use futures::StreamExt;
 use serde_json::json;
 use tkach::ProviderError;
 use tkach::message::Message;
-use tkach::provider::Request;
+use tkach::provider::{Request, ThinkingConfig};
 use tkach::providers::Anthropic;
 use tkach::providers::anthropic::batch::{BatchOutcome, BatchRequest, BatchStatus};
 use wiremock::matchers::{header, method, path, query_param};
@@ -86,6 +86,34 @@ async fn create_batch_posts_requests_and_parses_handle() {
     assert_eq!(handle.status, BatchStatus::InProgress);
     assert_eq!(handle.request_counts.processing, 2);
     assert!(!handle.is_terminal());
+}
+
+#[tokio::test]
+async fn create_batch_honors_per_request_thinking_override() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/messages/batches"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(handle_json(
+            "msgbatch_01ABC",
+            "in_progress",
+            json!({"processing": 1, "succeeded": 0, "errored": 0, "canceled": 0, "expired": 0}),
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut request = req("req-1");
+    request.params.thinking = Some(ThinkingConfig::Budget(2048));
+
+    let client = anthropic(&server).with_thinking_budget(1024);
+    client.create_batch(vec![request]).await.expect("submit ok");
+
+    let received = &server.received_requests().await.unwrap()[0];
+    let body: serde_json::Value = serde_json::from_slice(&received.body).unwrap();
+    let params = &body["requests"][0]["params"];
+    assert_eq!(params["thinking"]["type"], "enabled");
+    assert_eq!(params["thinking"]["budget_tokens"], 2048);
 }
 
 #[tokio::test]
