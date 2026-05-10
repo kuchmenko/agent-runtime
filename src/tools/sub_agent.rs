@@ -205,9 +205,10 @@ impl Tool for SubAgent {
         let system_override = input["system"].as_str().map(String::from);
         let system = system_override.or_else(|| self.system.clone());
 
+        let parent_policy = ctx.executor.policy_arc_for_fork();
         let policy_override = self.tools_allow.as_ref().map(|allow| {
             Arc::new(IntersectPolicy {
-                left: ctx.executor.policy_arc_for_fork(),
+                left: Arc::clone(&parent_policy),
                 right: Arc::new(AllowList::new(allow.iter().cloned())),
             }) as Arc<dyn crate::executor::ToolPolicy>
         });
@@ -237,11 +238,23 @@ impl Tool for SubAgent {
         }
         if self.filter_tool_definitions {
             if let Some(allow) = &self.tools_allow {
-                builder = builder.tool_definition_filter(allow.clone());
+                let visible = allow
+                    .iter()
+                    .filter(|name| parent_policy.is_allowed(name))
+                    .cloned()
+                    .collect();
+                builder = builder.tool_definition_filter(visible);
             }
         }
 
-        let agent = builder.build_unchecked();
+        let agent = match builder.build() {
+            Ok(agent) => agent,
+            Err(e) => {
+                return Ok(ToolOutput::error(format!(
+                    "Sub-agent configuration error: {e}"
+                )));
+            }
+        };
         let child_cancel = ctx.cancel.child_token();
         let history = vec![Message::user_text(prompt)];
 
