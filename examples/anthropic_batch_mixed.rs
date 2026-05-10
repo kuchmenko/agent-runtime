@@ -26,7 +26,7 @@ fn ok_request(custom_id: &str, prompt: &str) -> BatchRequest {
     BatchRequest {
         custom_id: custom_id.into(),
         params: Request {
-            model: "claude-haiku-4-5-20251001".into(),
+            model: tkach::model::claude::HAIKU_20251001.into(),
             system: None,
             messages: vec![Message::user_text(prompt)],
             tools: vec![],

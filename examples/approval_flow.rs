@@ -73,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let agent = Agent::builder()
         .provider(Anthropic::from_env())
-        .model("claude-haiku-4-5-20251001")
+        .model(tkach::model::claude::HAIKU_20251001)
         .system(
             "You are concise. When a tool you call is denied or fails, \
              explain to the user briefly what happened — do NOT silently \

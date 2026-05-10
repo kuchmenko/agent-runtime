@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use serde_json::{Value, json};
 
-use super::openai_responses_proto as proto;
+use super::openai_responses_proto::{self as proto, OpenAIEffort, OpenAISummary};
 use crate::error::ProviderError;
 use crate::provider::{LlmProvider, Request, Response};
 use crate::stream::ProviderEventStream;
@@ -35,8 +35,8 @@ pub struct OpenAIResponses {
 
 #[derive(Debug, Clone)]
 struct ReasoningConfig {
-    effort: String,
-    summary: String,
+    effort: OpenAIEffort,
+    summary: OpenAISummary,
 }
 
 impl OpenAIResponses {
@@ -67,7 +67,11 @@ impl OpenAIResponses {
     /// Typical values: effort `low|medium|high`, summary
     /// `auto|concise|detailed`. OpenAI validates the exact combinations
     /// per model.
-    pub fn with_reasoning(mut self, effort: impl Into<String>, summary: impl Into<String>) -> Self {
+    pub fn with_reasoning(
+        mut self,
+        effort: impl Into<OpenAIEffort>,
+        summary: impl Into<OpenAISummary>,
+    ) -> Self {
         self.reasoning = Some(ReasoningConfig {
             effort: effort.into(),
             summary: summary.into(),
@@ -172,8 +176,8 @@ fn build_request_body(
     }
     if let Some(reasoning) = reasoning {
         body["reasoning"] = json!({
-            "effort": reasoning.effort,
-            "summary": reasoning.summary,
+            "effort": reasoning.effort.as_wire(),
+            "summary": reasoning.summary.as_wire(),
         });
     }
     if include_encrypted_reasoning {
@@ -209,8 +213,8 @@ mod tests {
             temperature: None,
         };
         let reasoning = ReasoningConfig {
-            effort: "medium".into(),
-            summary: "auto".into(),
+            effort: OpenAIEffort::Medium,
+            summary: OpenAISummary::Auto,
         };
 
         let body = build_request_body(&req, Some(&reasoning), true);

@@ -32,6 +32,100 @@ use crate::stream::StreamEvent;
 
 // --- Request body helpers -------------------------------------------------
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenAIEffort {
+    Low,
+    Medium,
+    High,
+    Other(String),
+}
+
+impl OpenAIEffort {
+    pub fn as_wire(&self) -> &str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Other(value) => value.as_str(),
+        }
+    }
+}
+
+impl From<&str> for OpenAIEffort {
+    fn from(value: &str) -> Self {
+        if value.eq_ignore_ascii_case("low") {
+            Self::Low
+        } else if value.eq_ignore_ascii_case("medium") {
+            Self::Medium
+        } else if value.eq_ignore_ascii_case("high") {
+            Self::High
+        } else {
+            Self::Other(value.to_string())
+        }
+    }
+}
+
+impl From<String> for OpenAIEffort {
+    fn from(value: String) -> Self {
+        if value.eq_ignore_ascii_case("low") {
+            Self::Low
+        } else if value.eq_ignore_ascii_case("medium") {
+            Self::Medium
+        } else if value.eq_ignore_ascii_case("high") {
+            Self::High
+        } else {
+            Self::Other(value)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenAISummary {
+    Auto,
+    Concise,
+    Detailed,
+    Other(String),
+}
+
+impl OpenAISummary {
+    pub fn as_wire(&self) -> &str {
+        match self {
+            Self::Auto => "auto",
+            Self::Concise => "concise",
+            Self::Detailed => "detailed",
+            Self::Other(value) => value.as_str(),
+        }
+    }
+}
+
+impl From<&str> for OpenAISummary {
+    fn from(value: &str) -> Self {
+        if value.eq_ignore_ascii_case("auto") {
+            Self::Auto
+        } else if value.eq_ignore_ascii_case("concise") {
+            Self::Concise
+        } else if value.eq_ignore_ascii_case("detailed") {
+            Self::Detailed
+        } else {
+            Self::Other(value.to_string())
+        }
+    }
+}
+
+impl From<String> for OpenAISummary {
+    fn from(value: String) -> Self {
+        if value.eq_ignore_ascii_case("auto") {
+            Self::Auto
+        } else if value.eq_ignore_ascii_case("concise") {
+            Self::Concise
+        } else if value.eq_ignore_ascii_case("detailed") {
+            Self::Detailed
+        } else {
+            Self::Other(value)
+        }
+    }
+}
+
 /// Concatenate `Request.system` blocks with `\n\n`. `None` if absent or empty.
 pub(super) fn instructions(request: &Request) -> Option<String> {
     let joined = request
@@ -1053,5 +1147,52 @@ fn stream_error(value: &Value) -> ProviderError {
         status: 500,
         message,
         retryable: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OpenAIEffort, OpenAISummary};
+
+    #[test]
+    fn openai_effort_variants_match_wire_names() {
+        assert_eq!(OpenAIEffort::Low.as_wire(), "low");
+        assert_eq!(OpenAIEffort::Medium.as_wire(), "medium");
+        assert_eq!(OpenAIEffort::High.as_wire(), "high");
+        assert_eq!(OpenAIEffort::Other("ultra".into()).as_wire(), "ultra");
+    }
+
+    #[test]
+    fn openai_effort_from_string_is_case_insensitive_and_preserves_other() {
+        assert_eq!(OpenAIEffort::from("HIGH"), OpenAIEffort::High);
+        assert_eq!(
+            OpenAIEffort::from("ultra"),
+            OpenAIEffort::Other("ultra".into())
+        );
+        assert_eq!(
+            OpenAIEffort::from(String::from("ULTRA")),
+            OpenAIEffort::Other("ULTRA".into())
+        );
+    }
+
+    #[test]
+    fn openai_summary_variants_match_wire_names() {
+        assert_eq!(OpenAISummary::Auto.as_wire(), "auto");
+        assert_eq!(OpenAISummary::Concise.as_wire(), "concise");
+        assert_eq!(OpenAISummary::Detailed.as_wire(), "detailed");
+        assert_eq!(OpenAISummary::Other("full".into()).as_wire(), "full");
+    }
+
+    #[test]
+    fn openai_summary_from_string_is_case_insensitive_and_preserves_other() {
+        assert_eq!(OpenAISummary::from("DETAILED"), OpenAISummary::Detailed);
+        assert_eq!(
+            OpenAISummary::from("full"),
+            OpenAISummary::Other("full".into())
+        );
+        assert_eq!(
+            OpenAISummary::from(String::from("FULL")),
+            OpenAISummary::Other("FULL".into())
+        );
     }
 }

@@ -10,3 +10,4 @@ pub use mock::Mock;
 pub use openai_codex::{CodexCredentials, CodexCredentialsProvider, OpenAICodex};
 pub use openai_compatible::OpenAICompatible;
 pub use openai_responses::OpenAIResponses;
+pub use openai_responses_proto::{OpenAIEffort, OpenAISummary};
