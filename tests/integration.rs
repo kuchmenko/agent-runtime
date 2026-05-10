@@ -44,7 +44,7 @@ fn require_api_key() -> Anthropic {
 fn haiku_agent(working_dir: &Path) -> Agent {
     Agent::builder()
         .provider(require_api_key())
-        .model("claude-haiku-4-5-20251001")
+        .model(tkach::model::claude::HAIKU_20251001)
         .system("You are a concise assistant. Use tools when needed. Be brief.")
         .tools(tkach::tools::defaults())
         .max_turns(10)
@@ -55,13 +55,13 @@ fn haiku_agent(working_dir: &Path) -> Agent {
 
 fn sonnet_agent(working_dir: &Path) -> Agent {
     let provider: Arc<dyn LlmProvider> = Arc::new(require_api_key());
-    let sub_agent = SubAgent::new(Arc::clone(&provider), "claude-haiku-4-5-20251001")
+    let sub_agent = SubAgent::new(Arc::clone(&provider), tkach::model::claude::HAIKU_20251001)
         .max_turns(10)
         .max_tokens(2048);
 
     Agent::builder()
         .provider_arc(provider)
-        .model("claude-sonnet-4-6")
+        .model(tkach::model::claude::SONNET)
         .system("You are a concise coding assistant. Use tools when needed. Be brief.")
         .tools(tkach::tools::defaults())
         .tool(tkach::tools::WebFetch)
@@ -139,7 +139,7 @@ fn temp_dir(name: &str) -> std::path::PathBuf {
 async fn smoke_provider_roundtrip() {
     let agent = Agent::builder()
         .provider(require_api_key())
-        .model("claude-haiku-4-5-20251001")
+        .model(tkach::model::claude::HAIKU_20251001)
         .system("Reply with exactly: PONG")
         .max_turns(1)
         .max_tokens(32)
@@ -462,8 +462,8 @@ async fn smoke_openai_compatible_roundtrip() {
 
     let base_url = std::env::var("OPENAI_BASE_URL")
         .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_string());
-    let model =
-        std::env::var("OPENAI_SMOKE_MODEL").unwrap_or_else(|_| "openai/gpt-5.5".to_string());
+    let model = std::env::var("OPENAI_SMOKE_MODEL")
+        .unwrap_or_else(|_| tkach::model::openrouter::OPENAI_GPT_5_5.to_string());
 
     let provider = OpenAICompatible::new(api_key).with_base_url(base_url);
 
@@ -533,7 +533,7 @@ async fn smoke_anthropic_stream_roundtrip() {
     let provider = require_api_key();
 
     let request = Request {
-        model: "claude-haiku-4-5-20251001".into(),
+        model: tkach::model::claude::HAIKU_20251001.into(),
         system: Some(vec![SystemBlock::text("Reply with exactly: PONG")]),
         messages: vec![Message::user_text("PING")],
         tools: vec![],
@@ -608,8 +608,8 @@ async fn smoke_openai_compatible_stream_roundtrip() {
 
     let base_url = std::env::var("OPENAI_BASE_URL")
         .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_string());
-    let model =
-        std::env::var("OPENAI_SMOKE_MODEL").unwrap_or_else(|_| "openai/gpt-5.5".to_string());
+    let model = std::env::var("OPENAI_SMOKE_MODEL")
+        .unwrap_or_else(|_| tkach::model::openrouter::OPENAI_GPT_5_5.to_string());
 
     let provider = OpenAICompatible::new(api_key).with_base_url(base_url);
 
@@ -673,7 +673,8 @@ async fn smoke_openai_responses_thinking_stream() {
 
     let base_url = std::env::var("OPENAI_RESPONSES_BASE_URL")
         .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-    let model = std::env::var("OPENAI_RESPONSES_MODEL").unwrap_or_else(|_| "gpt-5".to_string());
+    let model = std::env::var("OPENAI_RESPONSES_MODEL")
+        .unwrap_or_else(|_| tkach::model::gpt::FIVE.to_string());
     let effort =
         std::env::var("OPENAI_RESPONSES_REASONING_EFFORT").unwrap_or_else(|_| "medium".into());
     let summary =

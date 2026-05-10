@@ -6,7 +6,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let agent = Agent::builder()
         .provider(Anthropic::from_env())
-        .model("claude-sonnet-4-6")
+        .model(tkach::model::claude::SONNET)
         .system("You are a helpful coding assistant. Be concise.")
         .tools(tools::defaults())
         .build();

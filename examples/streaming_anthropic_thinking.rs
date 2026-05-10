@@ -29,8 +29,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let model =
-        std::env::var("ANTHROPIC_THINKING_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".into());
+    let model = std::env::var("ANTHROPIC_THINKING_MODEL")
+        .unwrap_or_else(|_| tkach::model::claude::SONNET.into());
     let budget = std::env::var("ANTHROPIC_THINKING_BUDGET")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())

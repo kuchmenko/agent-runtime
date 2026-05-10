@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let agent = Agent::builder()
         .provider(Anthropic::from_env())
-        .model("claude-haiku-4-5-20251001")
+        .model(tkach::model::claude::HAIKU_20251001)
         .system(
             "You are a concise assistant. Use tools when needed. \
              Never fabricate file contents — always verify by reading.",

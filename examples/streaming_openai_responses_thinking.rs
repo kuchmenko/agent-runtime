@@ -21,7 +21,7 @@ use std::io::Write;
 use futures::StreamExt;
 use tkach::{
     Agent, CancellationToken, Content, Message, StreamEvent, ThinkingMetadata, ThinkingProvider,
-    providers::OpenAIResponses,
+    providers::{OpenAIEffort, OpenAIResponses, OpenAISummary},
 };
 
 #[tokio::main]
@@ -44,17 +44,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
     let model = std::env::var("OPENAI_RESPONSES_MODEL").unwrap_or_else(|_| {
         if base_url.contains("openrouter.ai") {
-            std::env::var("OPENAI_SMOKE_MODEL").unwrap_or_else(|_| "openai/gpt-5.5".to_string())
+            std::env::var("OPENAI_SMOKE_MODEL")
+                .unwrap_or_else(|_| tkach::model::openrouter::OPENAI_GPT_5_5.to_string())
         } else {
-            "gpt-5".to_string()
+            tkach::model::gpt::FIVE.to_string()
         }
     });
-    let effort =
-        std::env::var("OPENAI_RESPONSES_REASONING_EFFORT").unwrap_or_else(|_| "medium".into());
-    let summary =
-        std::env::var("OPENAI_RESPONSES_REASONING_SUMMARY").unwrap_or_else(|_| "detailed".into());
+    let effort: OpenAIEffort = std::env::var("OPENAI_RESPONSES_REASONING_EFFORT")
+        .map(Into::into)
+        .unwrap_or(OpenAIEffort::Medium);
+    let summary: OpenAISummary = std::env::var("OPENAI_RESPONSES_REASONING_SUMMARY")
+        .map(Into::into)
+        .unwrap_or(OpenAISummary::Detailed);
 
-    eprintln!("[model: {model}]  [base: {base_url}]  [reasoning: {effort}/{summary}]");
+    eprintln!(
+        "[model: {model}]  [base: {base_url}]  [reasoning: {}/{}]",
+        effort.as_wire(),
+        summary.as_wire()
+    );
     eprintln!();
 
     let provider = OpenAIResponses::new(api_key)

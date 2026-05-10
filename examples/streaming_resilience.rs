@@ -74,7 +74,7 @@ async fn phase1_tool_failure(provider: &Arc<Anthropic>) -> Result<(), Box<dyn st
 
     let agent = Agent::builder()
         .provider_arc(provider.clone() as Arc<dyn tkach::LlmProvider>)
-        .model("claude-haiku-4-5-20251001")
+        .model(tkach::model::claude::HAIKU_20251001)
         .system(
             "You are a concise assistant. Use tools when helpful. \
              If a tool fails, explain the failure briefly to the user \
@@ -161,7 +161,7 @@ async fn phase2_cancel_during_tool(
 
     let agent = Agent::builder()
         .provider_arc(provider.clone() as Arc<dyn tkach::LlmProvider>)
-        .model("claude-haiku-4-5-20251001")
+        .model(tkach::model::claude::HAIKU_20251001)
         .system("You are concise. Run shell commands as asked, exactly.")
         .tools(tkach::tools::defaults())
         .max_turns(2)
@@ -255,7 +255,7 @@ async fn phase3_multi_block(provider: &Arc<Anthropic>) -> Result<(), Box<dyn std
     let agent = Agent::builder()
         .provider_arc(provider.clone() as Arc<dyn tkach::LlmProvider>)
         // Sonnet is more likely than Haiku to narrate before acting.
-        .model("claude-sonnet-4-6")
+        .model(tkach::model::claude::SONNET)
         .system(
             "You are a thoughtful assistant. Before calling a tool, \
              briefly state what you're about to do in one sentence \

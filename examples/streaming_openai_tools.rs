@@ -45,8 +45,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let base_url = std::env::var("OPENAI_BASE_URL")
         .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_string());
-    let model =
-        std::env::var("OPENAI_SMOKE_MODEL").unwrap_or_else(|_| "openai/gpt-5.5".to_string());
+    let model = std::env::var("OPENAI_SMOKE_MODEL")
+        .unwrap_or_else(|_| tkach::model::openrouter::OPENAI_GPT_5_5.to_string());
 
     eprintln!("[model: {model}]  [base: {base_url}]");
     eprintln!();

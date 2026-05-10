@@ -55,7 +55,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let base_url = std::env::var("OPENAI_CODEX_BASE_URL")
         .unwrap_or_else(|_| "https://chatgpt.com/backend-api".to_string());
-    let model = std::env::var("OPENAI_CODEX_MODEL").unwrap_or_else(|_| "gpt-5-codex".to_string());
+    let model = std::env::var("OPENAI_CODEX_MODEL")
+        .unwrap_or_else(|_| tkach::model::gpt::FIVE_CODEX.to_string());
     let originator = std::env::var("OPENAI_CODEX_ORIGINATOR").unwrap_or_else(|_| "tkach".into());
 
     eprintln!("[model: {model}]  [base: {base_url}]  [originator: {originator}]");

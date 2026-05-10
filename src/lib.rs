@@ -14,7 +14,7 @@
 //! async fn main() -> anyhow::Result<()> {
 //!     let agent = Agent::builder()
 //!         .provider(Anthropic::from_env())
-//!         .model("claude-sonnet-4-6")
+//!         .model(tkach::model::claude::SONNET)
 //!         .system("You are a helpful coding assistant.")
 //!         .tools(tools::defaults())
 //!         .build();
@@ -34,6 +34,7 @@ pub mod approval;
 pub mod error;
 pub mod executor;
 pub mod message;
+pub mod model;
 pub mod provider;
 pub mod providers;
 pub mod stream;
