@@ -50,14 +50,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // pattern.
     let provider: Arc<dyn LlmProvider> = Arc::new(Anthropic::from_env());
 
-    let sub_agent = SubAgent::new(Arc::clone(&provider), "claude-haiku-4-5-20251001")
+    let sub_agent = SubAgent::new(Arc::clone(&provider), tkach::model::claude::HAIKU_20251001)
         .system("You are a focused researcher. Read the file and report the figure verbatim.")
         .max_turns(5)
         .max_tokens(1024);
 
     let agent = Agent::builder()
         .provider_arc(Arc::clone(&provider))
-        .model("claude-sonnet-4-6")
+        .model(tkach::model::claude::SONNET)
         .system(
             "You are a concise senior analyst. When the user asks a question \
              that requires reading a file, delegate the read to a sub-agent \

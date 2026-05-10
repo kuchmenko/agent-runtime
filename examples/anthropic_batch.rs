@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|(i, text)| BatchRequest {
             custom_id: format!("req-{}", i + 1),
             params: Request {
-                model: "claude-haiku-4-5-20251001".into(),
+                model: tkach::model::claude::HAIKU_20251001.into(),
                 system: None,
                 messages: vec![Message::user_text(*text)],
                 tools: vec![],

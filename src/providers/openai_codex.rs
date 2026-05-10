@@ -36,7 +36,7 @@ use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde_json::{Value, json};
 
-use super::openai_responses_proto as proto;
+use super::openai_responses_proto::{self as proto, OpenAIEffort, OpenAISummary};
 use crate::error::ProviderError;
 use crate::message::{Content, StopReason, Usage};
 use crate::provider::{LlmProvider, Request, Response};
@@ -44,7 +44,7 @@ use crate::stream::{ProviderEventStream, StreamEvent};
 
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const DEFAULT_ORIGINATOR: &str = "tkach";
-const DEFAULT_REASONING_SUMMARY: &str = "auto";
+const DEFAULT_REASONING_SUMMARY: OpenAISummary = OpenAISummary::Auto;
 
 /// Bearer credentials for the ChatGPT subscription Codex backend.
 ///
@@ -116,8 +116,8 @@ pub struct OpenAICodex {
     client: reqwest::Client,
     base_url: String,
     originator: String,
-    reasoning_effort: Option<String>,
-    reasoning_summary: Option<String>,
+    reasoning_effort: Option<OpenAIEffort>,
+    reasoning_summary: Option<OpenAISummary>,
 }
 
 impl OpenAICodex {
@@ -132,7 +132,7 @@ impl OpenAICodex {
             base_url: DEFAULT_BASE_URL.to_string(),
             originator: DEFAULT_ORIGINATOR.to_string(),
             reasoning_effort: None,
-            reasoning_summary: Some(DEFAULT_REASONING_SUMMARY.to_string()),
+            reasoning_summary: Some(DEFAULT_REASONING_SUMMARY),
         }
     }
 
@@ -166,7 +166,7 @@ impl OpenAICodex {
     /// `include: ["reasoning.encrypted_content"]` alone gets you opaque
     /// replay state but no visible thinking text. Common values:
     /// `auto`, `concise`, `detailed`. OpenAI validates the exact set.
-    pub fn with_reasoning_summary(mut self, summary: impl Into<String>) -> Self {
+    pub fn with_reasoning_summary(mut self, summary: impl Into<OpenAISummary>) -> Self {
         self.reasoning_summary = Some(summary.into());
         self
     }
@@ -174,7 +174,7 @@ impl OpenAICodex {
     /// Set `reasoning.effort` (Codex/Responses-style models). Typical
     /// values: `low`, `medium`, `high`. Off by default — the backend
     /// picks its own effort budget when this is unset.
-    pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Self {
+    pub fn with_reasoning_effort(mut self, effort: impl Into<OpenAIEffort>) -> Self {
         self.reasoning_effort = Some(effort.into());
         self
     }
@@ -195,8 +195,8 @@ impl OpenAICodex {
     async fn send(&self, request: &Request) -> Result<reqwest::Response, ProviderError> {
         let body = build_request_body(
             request,
-            self.reasoning_effort.as_deref(),
-            self.reasoning_summary.as_deref(),
+            self.reasoning_effort.as_ref(),
+            self.reasoning_summary.as_ref(),
         );
         let credentials = self.credentials.credentials().await?;
 
@@ -296,8 +296,8 @@ fn flush_text(buf: &mut String, content: &mut Vec<Content>) {
 
 fn build_request_body(
     request: &Request,
-    reasoning_effort: Option<&str>,
-    reasoning_summary: Option<&str>,
+    reasoning_effort: Option<&OpenAIEffort>,
+    reasoning_summary: Option<&OpenAISummary>,
 ) -> Value {
     let mut body = json!({
         "model": request.model,
@@ -318,10 +318,10 @@ fn build_request_body(
     if reasoning_effort.is_some() || reasoning_summary.is_some() {
         let mut reasoning = serde_json::Map::new();
         if let Some(effort) = reasoning_effort {
-            reasoning.insert("effort".into(), json!(effort));
+            reasoning.insert("effort".into(), json!(effort.as_wire()));
         }
         if let Some(summary) = reasoning_summary {
-            reasoning.insert("summary".into(), json!(summary));
+            reasoning.insert("summary".into(), json!(summary.as_wire()));
         }
         body["reasoning"] = Value::Object(reasoning);
     }
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn body_uses_codex_envelope() {
-        let body = build_request_body(&sample_request(), None, Some("auto"));
+        let body = build_request_body(&sample_request(), None, Some(&OpenAISummary::Auto));
 
         assert_eq!(body["model"], "gpt-5-codex");
         assert_eq!(body["store"], false);
@@ -383,7 +383,10 @@ mod tests {
     #[test]
     fn reasoning_summary_default_is_auto() {
         let provider = OpenAICodex::with_static_credentials(CodexCredentials::new("t", "acct"));
-        assert_eq!(provider.reasoning_summary.as_deref(), Some("auto"));
+        assert_eq!(
+            provider.reasoning_summary.as_ref(),
+            Some(&OpenAISummary::Auto)
+        );
         assert!(provider.reasoning_effort.is_none());
     }
 
@@ -393,14 +396,18 @@ mod tests {
         // include=encrypted_content alone is not enough — the backend
         // only emits response.reasoning_summary_text.* when
         // reasoning.summary is set on the request.
-        let body = build_request_body(&sample_request(), None, Some("auto"));
+        let body = build_request_body(&sample_request(), None, Some(&OpenAISummary::Auto));
         assert_eq!(body["reasoning"]["summary"], "auto");
         assert!(body["reasoning"].get("effort").is_none());
     }
 
     #[test]
     fn body_emits_both_effort_and_summary_when_set() {
-        let body = build_request_body(&sample_request(), Some("medium"), Some("detailed"));
+        let body = build_request_body(
+            &sample_request(),
+            Some(&OpenAIEffort::Medium),
+            Some(&OpenAISummary::Detailed),
+        );
         assert_eq!(body["reasoning"]["effort"], "medium");
         assert_eq!(body["reasoning"]["summary"], "detailed");
     }
@@ -427,7 +434,7 @@ mod tests {
     fn body_omits_tools_when_none() {
         let mut req = sample_request();
         req.tools.clear();
-        let body = build_request_body(&req, None, Some("auto"));
+        let body = build_request_body(&req, None, Some(&OpenAISummary::Auto));
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
         assert!(body.get("parallel_tool_calls").is_none());
@@ -498,7 +505,7 @@ mod tests {
             temperature: None,
         };
 
-        let body = build_request_body(&req, None, Some("auto"));
+        let body = build_request_body(&req, None, Some(&OpenAISummary::Auto));
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[0]["type"], "function_call");
         assert_eq!(input[0]["call_id"], "call_1");

@@ -19,7 +19,7 @@ use std::io::Write;
 use futures::StreamExt;
 use tkach::{
     Agent, CancellationToken, Content, Message, StreamEvent, ThinkingMetadata, ThinkingProvider,
-    providers::Anthropic,
+    providers::anthropic::{Anthropic, AnthropicEffort},
 };
 
 #[tokio::main]
@@ -33,15 +33,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let model = std::env::var("ANTHROPIC_ADAPTIVE_THINKING_MODEL")
-        .unwrap_or_else(|_| "claude-sonnet-4-6".into());
-    let effort =
-        std::env::var("ANTHROPIC_ADAPTIVE_THINKING_EFFORT").unwrap_or_else(|_| "high".into());
+        .unwrap_or_else(|_| tkach::model::claude::SONNET.into());
+    let effort: AnthropicEffort = std::env::var("ANTHROPIC_ADAPTIVE_THINKING_EFFORT")
+        .map(Into::into)
+        .unwrap_or(AnthropicEffort::High);
     let max_tokens = std::env::var("ANTHROPIC_ADAPTIVE_THINKING_MAX_TOKENS")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(4096);
 
-    eprintln!("[model: {model}]  [adaptive effort: {effort}]  [max tokens: {max_tokens}]");
+    eprintln!(
+        "[model: {model}]  [adaptive effort: {}]  [max tokens: {max_tokens}]",
+        effort.as_wire()
+    );
     eprintln!();
 
     let provider = Anthropic::new(api_key).with_adaptive_thinking_effort(effort);

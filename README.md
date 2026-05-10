@@ -31,7 +31,7 @@ use tkach::{Agent, CancellationToken, Message, providers::Anthropic, tools};
 async fn main() -> anyhow::Result<()> {
     let agent = Agent::builder()
         .provider(Anthropic::from_env())
-        .model("claude-haiku-4-5-20251001")
+        .model(tkach::model::claude::HAIKU_20251001)
         .system("You are a concise assistant.")
         .tools(tools::defaults())
         .build();
@@ -129,7 +129,7 @@ Mutating (`ToolClass::Mutating` — executed sequentially):
 ## Providers
 
 ```rust
-use tkach::providers::{Anthropic, OpenAICompatible, OpenAIResponses};
+use tkach::providers::{Anthropic, OpenAIEffort, OpenAICompatible, OpenAIResponses, OpenAISummary};
 
 // Anthropic Messages API.
 let p = Anthropic::from_env();   // ANTHROPIC_API_KEY
@@ -139,7 +139,7 @@ let p = OpenAICompatible::from_env();   // OPENAI_API_KEY
 
 // OpenAI Responses API — required for reasoning-summary streams.
 let p = OpenAIResponses::from_env()
-    .with_reasoning("medium", "detailed");
+    .with_reasoning(OpenAIEffort::Medium, OpenAISummary::Detailed);
 
 // Any OpenAI-compatible Chat Completions endpoint:
 //   OpenRouter
@@ -153,14 +153,36 @@ let p = OpenAICompatible::new("ignored")
 
 Implementing your own provider: implement `LlmProvider` (one `complete` and one `stream` method).
 
+### Typed configuration
+
+Prefer typed constants/enums for autocomplete and typo resistance:
+
+```rust
+use tkach::{
+    model::{claude, gpt, openrouter},
+    providers::{OpenAIEffort, OpenAISummary, anthropic::AnthropicEffort},
+};
+
+Agent::builder().model(claude::SONNET);
+Agent::builder().model(gpt::FIVE);
+Agent::builder().model(openrouter::OPENAI_GPT_5_5);
+
+let effort = AnthropicEffort::High;
+let reasoning = (OpenAIEffort::Medium, OpenAISummary::Detailed);
+```
+
+Raw strings still work for new vendor values; they route through `Other(String)`.
+
 ### Anthropic extended thinking
 
 `Anthropic::with_adaptive_thinking_effort` (recommended on Claude Sonnet/Opus 4.6+) lets the model decide when to think. `with_thinking_budget` is the older fixed-token mode.
 
 ```rust
 // Adaptive thinking — recommended.
+use tkach::providers::anthropic::AnthropicEffort;
+
 let p = Anthropic::from_env()
-    .with_adaptive_thinking_effort("high");
+    .with_adaptive_thinking_effort(AnthropicEffort::High);
 
 // Manual budget — fixed-token mode.
 let p = Anthropic::from_env()
@@ -188,7 +210,7 @@ let provider = Anthropic::from_env();
 let requests = vec![BatchRequest {
     custom_id: "req-1".into(),               // ^[a-zA-Z0-9_-]{1,64}$, unique within batch
     params: Request {
-        model: "claude-haiku-4-5-20251001".into(),
+        model: tkach::model::claude::HAIKU_20251001.into(),
         system: None,
         messages: vec![Message::user_text("Say hello.")],
         tools: vec![],
@@ -225,7 +247,9 @@ Credentials are caller-owned. The provider does **not** implement OAuth login, r
 ```rust
 use async_trait::async_trait;
 use tkach::ProviderError;
-use tkach::providers::{CodexCredentials, CodexCredentialsProvider, OpenAICodex};
+use tkach::providers::{
+    CodexCredentials, CodexCredentialsProvider, OpenAICodex, OpenAIEffort, OpenAISummary,
+};
 
 struct MyTokenCache { /* OAuth client, refresh logic, keyring ... */ }
 
@@ -239,8 +263,8 @@ impl CodexCredentialsProvider for MyTokenCache {
 
 let provider = OpenAICodex::new(MyTokenCache { /* ... */ })
     .with_originator("my-app")                  // optional, defaults to "tkach"
-    .with_reasoning_summary("auto")             // optional, default "auto"
-    .with_reasoning_effort("medium");           // optional, off by default
+    .with_reasoning_summary(OpenAISummary::Auto)     // optional, default "auto"
+    .with_reasoning_effort(OpenAIEffort::Medium);     // optional, off by default
 
 // Static credentials are useful for tests and short-lived scripts:
 let provider = OpenAICodex::with_static_credentials(
@@ -322,7 +346,7 @@ impl ApprovalHandler for MyApproval {
 
 let agent = Agent::builder()
     .provider(Anthropic::from_env())
-    .model("claude-haiku-4-5-20251001")
+    .model(tkach::model::claude::HAIKU_20251001)
     .tools(tools::defaults())
     .approval(MyApproval)
     .build();

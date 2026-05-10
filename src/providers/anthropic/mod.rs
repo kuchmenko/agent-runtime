@@ -28,13 +28,72 @@ pub struct Anthropic {
     thinking: Option<AnthropicThinkingConfig>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnthropicEffort {
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+    Other(String),
+}
+
+impl AnthropicEffort {
+    pub fn as_wire(&self) -> &str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+            Self::Other(value) => value.as_str(),
+        }
+    }
+}
+
+impl From<&str> for AnthropicEffort {
+    fn from(value: &str) -> Self {
+        if value.eq_ignore_ascii_case("low") {
+            Self::Low
+        } else if value.eq_ignore_ascii_case("medium") {
+            Self::Medium
+        } else if value.eq_ignore_ascii_case("high") {
+            Self::High
+        } else if value.eq_ignore_ascii_case("xhigh") {
+            Self::XHigh
+        } else if value.eq_ignore_ascii_case("max") {
+            Self::Max
+        } else {
+            Self::Other(value.to_string())
+        }
+    }
+}
+
+impl From<String> for AnthropicEffort {
+    fn from(value: String) -> Self {
+        if value.eq_ignore_ascii_case("low") {
+            Self::Low
+        } else if value.eq_ignore_ascii_case("medium") {
+            Self::Medium
+        } else if value.eq_ignore_ascii_case("high") {
+            Self::High
+        } else if value.eq_ignore_ascii_case("xhigh") {
+            Self::XHigh
+        } else if value.eq_ignore_ascii_case("max") {
+            Self::Max
+        } else {
+            Self::Other(value)
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum AnthropicThinkingConfig {
     Manual {
         budget_tokens: u32,
     },
     Adaptive {
-        effort: Option<String>,
+        effort: Option<AnthropicEffort>,
         display: AnthropicThinkingDisplay,
     },
 }
@@ -108,7 +167,7 @@ impl Anthropic {
     ///
     /// Anthropic effort values are model-dependent; documented values are
     /// `low`, `medium`, `high`, `xhigh`, and `max`.
-    pub fn with_adaptive_thinking_effort(mut self, effort: impl Into<String>) -> Self {
+    pub fn with_adaptive_thinking_effort(mut self, effort: impl Into<AnthropicEffort>) -> Self {
         self.thinking = Some(AnthropicThinkingConfig::Adaptive {
             effort: Some(effort.into()),
             display: AnthropicThinkingDisplay::Summarized,
@@ -758,7 +817,7 @@ fn output_config(config: &AnthropicThinkingConfig) -> Option<ApiOutputConfig> {
             effort: Some(effort),
             ..
         } => Some(ApiOutputConfig {
-            effort: effort.clone(),
+            effort: effort.as_wire().to_string(),
         }),
         AnthropicThinkingConfig::Manual { .. }
         | AnthropicThinkingConfig::Adaptive { effort: None, .. } => None,
@@ -893,6 +952,30 @@ mod tests {
         let req = req_with_system(blocks);
         let body = build_request_body(&req);
         serde_json::to_value(&body).unwrap()
+    }
+
+    #[test]
+    fn anthropic_effort_variants_match_wire_names() {
+        assert_eq!(AnthropicEffort::Low.as_wire(), "low");
+        assert_eq!(AnthropicEffort::Medium.as_wire(), "medium");
+        assert_eq!(AnthropicEffort::High.as_wire(), "high");
+        assert_eq!(AnthropicEffort::XHigh.as_wire(), "xhigh");
+        assert_eq!(AnthropicEffort::Max.as_wire(), "max");
+        assert_eq!(AnthropicEffort::Other("ultra".into()).as_wire(), "ultra");
+    }
+
+    #[test]
+    fn anthropic_effort_from_string_is_case_insensitive_and_preserves_other() {
+        assert_eq!(AnthropicEffort::from("XHIGH"), AnthropicEffort::XHigh);
+        assert_eq!(AnthropicEffort::from("MAX"), AnthropicEffort::Max);
+        assert_eq!(
+            AnthropicEffort::from("ultra"),
+            AnthropicEffort::Other("ultra".into())
+        );
+        assert_eq!(
+            AnthropicEffort::from(String::from("ULTRA")),
+            AnthropicEffort::Other("ULTRA".into())
+        );
     }
 
     #[test]
@@ -1048,7 +1131,7 @@ mod tests {
         let body = build_request_body_with_thinking(
             &req,
             Some(AnthropicThinkingConfig::Adaptive {
-                effort: Some("high".into()),
+                effort: Some(AnthropicEffort::High),
                 display: AnthropicThinkingDisplay::Summarized,
             }),
         );

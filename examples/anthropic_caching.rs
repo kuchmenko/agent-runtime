@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }];
 
     let make_request = |user: &str| Request {
-        model: "claude-sonnet-4-6".into(),
+        model: tkach::model::claude::SONNET.into(),
         system: Some(vec![SystemBlock::cached(&stable_system)]),
         messages: vec![Message::user_text(user)],
         tools: tools.clone(),
