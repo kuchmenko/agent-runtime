@@ -71,6 +71,24 @@ pub struct Request {
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: u32,
     pub temperature: Option<f32>,
+    /// Optional per-call thinking/reasoning override. When set, providers
+    /// that support thinking use it instead of their instance default.
+    pub thinking: Option<ThinkingConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThinkingConfig {
+    Effort(ThinkingEffort),
+    Budget(u32),
+    Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThinkingEffort {
+    Low,
+    Medium,
+    High,
+    Other(String),
 }
 
 /// Response from the LLM provider.

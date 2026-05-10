@@ -17,7 +17,7 @@
 //!         .model(tkach::model::claude::SONNET)
 //!         .system("You are a helpful coding assistant.")
 //!         .tools(tools::defaults())
-//!         .build();
+//!         .build()?;
 //!
 //!     let mut history = vec![Message::user_text(
 //!         "What files are in the current directory?",
@@ -35,6 +35,7 @@ pub mod error;
 pub mod executor;
 pub mod message;
 pub mod model;
+pub mod policy;
 pub mod provider;
 pub mod providers;
 pub mod stream;
@@ -42,7 +43,7 @@ pub mod tool;
 pub mod tools;
 
 // Re-export core types at the crate root for convenience.
-pub use agent::{Agent, AgentBuilder, AgentResult, AgentStream};
+pub use agent::{Agent, AgentBuilder, AgentResult, AgentStream, BuildError};
 pub use approval::{ApprovalDecision, ApprovalHandler, AutoApprove};
 pub use error::{AgentError, ProviderError, ToolError};
 pub use executor::{
@@ -52,7 +53,10 @@ pub use message::{
     CacheControl, CacheTtl, Content, Message, Role, StopReason, ThinkingMetadata, ThinkingProvider,
     Usage,
 };
-pub use provider::{LlmProvider, Request, Response, SystemBlock, ToolDefinition};
+pub use policy::{AllowList, IntersectPolicy};
+pub use provider::{
+    LlmProvider, Request, Response, SystemBlock, ThinkingConfig, ThinkingEffort, ToolDefinition,
+};
 pub use stream::{ProviderEventStream, StreamEvent};
 pub use tokio_util::sync::CancellationToken;
 pub use tool::{Tool, ToolClass, ToolContext, ToolOutput};

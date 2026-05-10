@@ -51,7 +51,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .max_turns(1)
         .max_tokens(max_tokens)
-        .build();
+        .build()
+        .unwrap();
 
     let mut stream = agent.stream(
         vec![Message::user_text(

@@ -39,7 +39,7 @@ use serde_json::{Value, json};
 use super::openai_responses_proto::{self as proto, OpenAIEffort, OpenAISummary};
 use crate::error::ProviderError;
 use crate::message::{Content, StopReason, Usage};
-use crate::provider::{LlmProvider, Request, Response};
+use crate::provider::{LlmProvider, Request, Response, ThinkingConfig, ThinkingEffort};
 use crate::stream::{ProviderEventStream, StreamEvent};
 
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -195,8 +195,8 @@ impl OpenAICodex {
     async fn send(&self, request: &Request) -> Result<reqwest::Response, ProviderError> {
         let body = build_request_body(
             request,
-            self.reasoning_effort.as_ref(),
-            self.reasoning_summary.as_ref(),
+            effective_reasoning_effort(request, self.reasoning_effort.as_ref()).as_ref(),
+            effective_reasoning_summary(request, self.reasoning_summary.as_ref()).as_ref(),
         );
         let credentials = self.credentials.credentials().await?;
 
@@ -294,6 +294,38 @@ fn flush_text(buf: &mut String, content: &mut Vec<Content>) {
     }
 }
 
+fn effective_reasoning_effort(
+    request: &Request,
+    instance: Option<&OpenAIEffort>,
+) -> Option<OpenAIEffort> {
+    match &request.thinking {
+        Some(ThinkingConfig::Disabled) => None,
+        Some(ThinkingConfig::Budget(_)) => instance.cloned(),
+        Some(ThinkingConfig::Effort(effort)) => Some(map_thinking_effort(effort)),
+        None => instance.cloned(),
+    }
+}
+
+fn effective_reasoning_summary(
+    request: &Request,
+    instance: Option<&OpenAISummary>,
+) -> Option<OpenAISummary> {
+    match &request.thinking {
+        Some(ThinkingConfig::Disabled) => None,
+        Some(ThinkingConfig::Effort(_)) => Some(instance.cloned().unwrap_or(OpenAISummary::Auto)),
+        Some(ThinkingConfig::Budget(_)) | None => instance.cloned(),
+    }
+}
+
+fn map_thinking_effort(effort: &ThinkingEffort) -> OpenAIEffort {
+    match effort {
+        ThinkingEffort::Low => OpenAIEffort::Low,
+        ThinkingEffort::Medium => OpenAIEffort::Medium,
+        ThinkingEffort::High => OpenAIEffort::High,
+        ThinkingEffort::Other(value) => OpenAIEffort::from(value.as_str()),
+    }
+}
+
 fn build_request_body(
     request: &Request,
     reasoning_effort: Option<&OpenAIEffort>,
@@ -355,6 +387,7 @@ mod tests {
             }],
             max_tokens: 256,
             temperature: Some(0.5),
+            thinking: None,
         }
     }
 
@@ -503,6 +536,7 @@ mod tests {
             tools: vec![],
             max_tokens: 128,
             temperature: None,
+            thinking: None,
         };
 
         let body = build_request_body(&req, None, Some(&OpenAISummary::Auto));

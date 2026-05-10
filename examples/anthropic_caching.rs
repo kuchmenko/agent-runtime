@@ -64,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tools: tools.clone(),
         max_tokens: 64,
         temperature: None,
+        thinking: None,
     };
 
     println!("=== first call (cache write) ===");

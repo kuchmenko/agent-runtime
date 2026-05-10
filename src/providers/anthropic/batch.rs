@@ -608,6 +608,7 @@ mod tests {
                 tools: vec![],
                 max_tokens: 64,
                 temperature: None,
+                thinking: None,
             },
         }
     }

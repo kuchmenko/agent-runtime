@@ -69,7 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_turns(5)
         .max_tokens(512)
         .working_dir(&dir)
-        .build();
+        .build()
+        .unwrap();
 
     let mut stream = agent.stream(
         vec![Message::user_text(

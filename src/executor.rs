@@ -460,6 +460,10 @@ impl ToolExecutor {
         &self.registry
     }
 
+    pub(crate) fn policy_arc_for_fork(&self) -> Arc<dyn ToolPolicy> {
+        Arc::clone(&self.policy)
+    }
+
     /// Build an executor for a nested sub-agent that shares this
     /// executor's registry, policy, and approval handler — but has
     /// independent concurrency permit accounting.
@@ -478,10 +482,22 @@ impl ToolExecutor {
     /// work is no longer globally bounded, only per-level bounded.
     #[must_use]
     pub fn fork_for_subagent(&self) -> Arc<Self> {
+        self.fork_for_subagent_with(None, None)
+    }
+
+    /// Like [`fork_for_subagent`](Self::fork_for_subagent), but lets the caller
+    /// override the child policy and/or approval handler while keeping the
+    /// shared registry and fresh per-level concurrency permits.
+    #[must_use]
+    pub fn fork_for_subagent_with(
+        &self,
+        policy_override: Option<Arc<dyn ToolPolicy>>,
+        approval_override: Option<Arc<dyn ApprovalHandler>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             registry: Arc::clone(&self.registry),
-            policy: Arc::clone(&self.policy),
-            approval: Arc::clone(&self.approval),
+            policy: policy_override.unwrap_or_else(|| Arc::clone(&self.policy)),
+            approval: approval_override.unwrap_or_else(|| Arc::clone(&self.approval)),
             concurrency: self.concurrency.fork(),
         })
     }

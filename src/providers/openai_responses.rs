@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use super::openai_responses_proto::{self as proto, OpenAIEffort, OpenAISummary};
 use crate::error::ProviderError;
-use crate::provider::{LlmProvider, Request, Response};
+use crate::provider::{LlmProvider, Request, Response, ThinkingConfig, ThinkingEffort};
 use crate::stream::ProviderEventStream;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -99,7 +99,7 @@ impl LlmProvider for OpenAIResponses {
     async fn stream(&self, request: Request) -> Result<ProviderEventStream, ProviderError> {
         let mut body = build_request_body(
             &request,
-            self.reasoning.as_ref(),
+            effective_reasoning(&request, self.reasoning.as_ref()).as_ref(),
             self.include_encrypted_reasoning,
         );
         body["stream"] = json!(true);
@@ -129,7 +129,7 @@ impl LlmProvider for OpenAIResponses {
     async fn complete(&self, request: Request) -> Result<Response, ProviderError> {
         let body = build_request_body(
             &request,
-            self.reasoning.as_ref(),
+            effective_reasoning(&request, self.reasoning.as_ref()).as_ref(),
             self.include_encrypted_reasoning,
         );
 
@@ -194,6 +194,32 @@ fn build_request_body(
     body
 }
 
+fn effective_reasoning(
+    request: &Request,
+    instance: Option<&ReasoningConfig>,
+) -> Option<ReasoningConfig> {
+    match &request.thinking {
+        Some(ThinkingConfig::Disabled) => None,
+        Some(ThinkingConfig::Budget(_)) => instance.cloned(),
+        Some(ThinkingConfig::Effort(effort)) => Some(ReasoningConfig {
+            effort: map_thinking_effort(effort),
+            summary: instance
+                .map(|r| r.summary.clone())
+                .unwrap_or(OpenAISummary::Auto),
+        }),
+        None => instance.cloned(),
+    }
+}
+
+fn map_thinking_effort(effort: &ThinkingEffort) -> OpenAIEffort {
+    match effort {
+        ThinkingEffort::Low => OpenAIEffort::Low,
+        ThinkingEffort::Medium => OpenAIEffort::Medium,
+        ThinkingEffort::High => OpenAIEffort::High,
+        ThinkingEffort::Other(value) => OpenAIEffort::from(value.as_str()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +237,7 @@ mod tests {
             tools: vec![],
             max_tokens: 128,
             temperature: None,
+            thinking: None,
         };
         let reasoning = ReasoningConfig {
             effort: OpenAIEffort::Medium,
@@ -255,6 +282,7 @@ mod tests {
             tools: vec![],
             max_tokens: 128,
             temperature: None,
+            thinking: None,
         };
 
         let body = build_request_body(&req, None, true);

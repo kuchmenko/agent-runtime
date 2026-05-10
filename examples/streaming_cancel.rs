@@ -33,7 +33,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .system("You are verbose and detailed.")
         .max_turns(1)
         .max_tokens(2048)
-        .build();
+        .build()
+        .unwrap();
 
     let cancel = CancellationToken::new();
     let cancel_handle = cancel.clone();

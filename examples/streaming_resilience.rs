@@ -84,7 +84,8 @@ async fn phase1_tool_failure(provider: &Arc<Anthropic>) -> Result<(), Box<dyn st
         .max_turns(5)
         .max_tokens(512)
         .working_dir(&dir)
-        .build();
+        .build()
+        .unwrap();
 
     let mut stream = agent.stream(
         vec![Message::user_text(format!(
@@ -167,7 +168,8 @@ async fn phase2_cancel_during_tool(
         .max_turns(2)
         .max_tokens(256)
         .working_dir(&dir)
-        .build();
+        .build()
+        .unwrap();
 
     let cancel = CancellationToken::new();
     let cancel_arm = cancel.clone();
@@ -265,7 +267,8 @@ async fn phase3_multi_block(provider: &Arc<Anthropic>) -> Result<(), Box<dyn std
         .max_turns(3)
         .max_tokens(1024)
         .working_dir(&dir)
-        .build();
+        .build()
+        .unwrap();
 
     let mut stream = agent.stream(
         vec![Message::user_text(

@@ -32,6 +32,7 @@ fn ok_request(custom_id: &str, prompt: &str) -> BatchRequest {
             tools: vec![],
             max_tokens: 64,
             temperature: Some(0.0),
+            thinking: None,
         },
     }
 }
@@ -48,6 +49,7 @@ fn bad_request(custom_id: &str) -> BatchRequest {
             tools: vec![],
             max_tokens: 32,
             temperature: None,
+            thinking: None,
         },
     }
 }

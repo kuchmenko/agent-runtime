@@ -32,6 +32,7 @@ fn req(custom_id: &str) -> BatchRequest {
             tools: vec![],
             max_tokens: 64,
             temperature: None,
+            thinking: None,
         },
     }
 }

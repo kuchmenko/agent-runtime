@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use crate::executor::{
     AllowAll, ConcurrencyConfig, ToolCall, ToolConcurrency, ToolExecutor, ToolPolicy, ToolRegistry,
 };
 use crate::message::{CacheControl, Content, Message, StopReason, Usage};
-use crate::provider::{LlmProvider, Request, SystemBlock, ToolDefinition};
+use crate::provider::{LlmProvider, Request, SystemBlock, ThinkingConfig, ToolDefinition};
 use crate::stream::StreamEvent;
 use crate::tool::{Tool, ToolContext};
 
@@ -43,6 +44,14 @@ const FALLBACK_STOP_REASON: StopReason = StopReason::EndTurn;
 /// history.extend(result.new_messages);
 /// save_session(&history);
 /// ```
+#[derive(Debug, thiserror::Error)]
+pub enum BuildError {
+    #[error(
+        "duplicate tool name '{name}' (registered {count} times); each tool must have a unique name"
+    )]
+    DuplicateToolName { name: String, count: usize },
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentResult {
     /// Messages appended by this run only — **not** the full history.
@@ -82,6 +91,8 @@ pub struct Agent {
     /// over the entire toolset. Anthropic-only optimization;
     /// non-Anthropic providers ignore the field.
     cache_tools: Option<CacheControl>,
+    thinking: Option<ThinkingConfig>,
+    tool_definition_filter: Option<HashSet<String>>,
 }
 
 impl Agent {
@@ -107,6 +118,11 @@ impl Agent {
             .executor
             .registry()
             .iter()
+            .filter(|t| {
+                self.tool_definition_filter
+                    .as_ref()
+                    .is_none_or(|allowed| allowed.contains(t.name()))
+            })
             .map(|t| ToolDefinition {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
@@ -182,6 +198,7 @@ impl Agent {
                 tools: tool_defs.clone(),
                 max_tokens: self.max_tokens,
                 temperature: self.temperature,
+                thinking: self.thinking.clone(),
             };
 
             let response = match self.provider.complete(request).await {
@@ -349,6 +366,7 @@ impl Agent {
                 tools: tool_defs.clone(),
                 max_tokens: self.max_tokens,
                 temperature: self.temperature,
+                thinking: self.thinking.clone(),
             };
 
             let mut provider_stream = match self.provider.stream(request).await {
@@ -747,6 +765,8 @@ pub struct AgentBuilder {
     read_cap: usize,
     mut_cap: usize,
     tool_concurrencies: Vec<(String, ToolConcurrency)>,
+    thinking: Option<ThinkingConfig>,
+    tool_definition_filter: Option<HashSet<String>>,
 }
 
 impl AgentBuilder {
@@ -769,6 +789,8 @@ impl AgentBuilder {
             read_cap: 20,
             mut_cap: 10,
             tool_concurrencies: Vec::new(),
+            thinking: None,
+            tool_definition_filter: None,
         }
     }
 
@@ -896,6 +918,16 @@ impl AgentBuilder {
         self
     }
 
+    pub fn thinking(mut self, thinking: ThinkingConfig) -> Self {
+        self.thinking = Some(thinking);
+        self
+    }
+
+    pub(crate) fn tool_definition_filter(mut self, allowed: HashSet<String>) -> Self {
+        self.tool_definition_filter = Some(allowed);
+        self
+    }
+
     pub fn working_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.working_dir = Some(dir.into());
         self
@@ -1014,7 +1046,12 @@ impl AgentBuilder {
         self
     }
 
-    pub fn build(self) -> Agent {
+    pub fn build(self) -> Result<Agent, BuildError> {
+        self.validate_tool_names()?;
+        Ok(self.build_unchecked())
+    }
+
+    pub(crate) fn build_unchecked(self) -> Agent {
         let executor = self.executor_override.unwrap_or_else(|| {
             let registry = Arc::new(ToolRegistry::new(self.tools));
             let policy: Arc<dyn ToolPolicy> = self.policy.unwrap_or_else(|| Arc::new(AllowAll));
@@ -1044,6 +1081,22 @@ impl AgentBuilder {
             max_depth: self.max_depth,
             depth: self.depth,
             cache_tools: self.cache_tools,
+            thinking: self.thinking,
+            tool_definition_filter: self.tool_definition_filter,
         }
+    }
+
+    fn validate_tool_names(&self) -> Result<(), BuildError> {
+        if self.executor_override.is_some() {
+            return Ok(());
+        }
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for tool in &self.tools {
+            *counts.entry(tool.name().to_string()).or_insert(0) += 1;
+        }
+        if let Some((name, count)) = counts.into_iter().find(|(_, count)| *count > 1) {
+            return Err(BuildError::DuplicateToolName { name, count });
+        }
+        Ok(())
     }
 }

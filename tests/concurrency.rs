@@ -244,7 +244,8 @@ async fn parallel_writes_with_promotion_overlap() {
             delay_ms: WRITE_DELAY_MS,
         })
         .tool_concurrency("slow_write", ToolConcurrency::on())
-        .build();
+        .build()
+        .unwrap();
 
     let started = Instant::now();
     let result = agent
@@ -304,7 +305,8 @@ async fn writes_without_promotion_serialise() {
             delay_ms: WRITE_DELAY_MS,
         })
         // NO tool_concurrency call — slow_write stays in serial_mut.
-        .build();
+        .build()
+        .unwrap();
 
     let started = Instant::now();
     let _ = agent
@@ -344,7 +346,8 @@ async fn parallel_subagents_with_promotion_overlap() {
         })
         .tool(SubAgent::new(sub_provider(), "mock-sub").max_turns(3))
         .tool_concurrency("agent", ToolConcurrency::on())
-        .build();
+        .build()
+        .unwrap();
 
     let started = Instant::now();
     let result = agent
@@ -395,7 +398,8 @@ async fn subagents_overlap_without_explicit_promotion() {
         .tool(SubAgent::new(sub_provider(), "mock-sub").max_turns(3))
         // No `tool_concurrency` call — but is_recursive admits
         // through concurrent_mut anyway.
-        .build();
+        .build()
+        .unwrap();
 
     let started = Instant::now();
     let _ = agent
@@ -486,7 +490,8 @@ async fn siblings_serialise_on_default_mutating_tools() {
         // No `tool_concurrency` for "slow_write" — it stays
         // default-Mutating, must serialise via shared serial_mut
         // even though the two parent sub-agents run in parallel.
-        .build();
+        .build()
+        .unwrap();
 
     let started = Instant::now();
     let _ = agent
@@ -575,7 +580,8 @@ async fn parallel_writes_preserve_input_order() {
         // input order rather than completion order.
         .tool(SlowWriter { delay_ms: 150 })
         .tool_concurrency("slow_write", ToolConcurrency::on())
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(
@@ -648,7 +654,8 @@ async fn cancel_during_parallel_batch_short_circuits_pending_calls() {
         .tool(SlowWriter { delay_ms: 500 })
         // Cap at 1 to force queueing.
         .tool_concurrency("slow_write", ToolConcurrency::on().max(1))
-        .build();
+        .build()
+        .unwrap();
 
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
@@ -764,7 +771,8 @@ async fn read_after_write_observes_the_write() {
         // the cross-class barrier between [promoted-Mut, RO] is
         // independent of within-class concurrency.
         .tool_concurrency("slow_write", ToolConcurrency::on())
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(
@@ -883,7 +891,8 @@ async fn nested_promoted_fanout_does_not_deadlock_when_parent_saturates_pool() {
         // concurrent_mut pool of width 2.
         .tool_concurrency("agent", ToolConcurrency::on())
         .tool_concurrency("slow_write", ToolConcurrency::on())
-        .build();
+        .build()
+        .unwrap();
 
     // The whole flow should complete without timing out. If the
     // forking is broken and deadlock occurs, this future stalls
@@ -985,7 +994,8 @@ async fn agent_built_without_concurrency_methods_matches_pre_feature_behaviour()
         .provider(mock)
         .model("mock")
         .tool(SlowReadOnly { delay_ms: 150 })
-        .build();
+        .build()
+        .unwrap();
 
     let started = Instant::now();
     let result = agent

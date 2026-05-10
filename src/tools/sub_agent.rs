@@ -1,35 +1,26 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::Agent;
+use crate::approval::ApprovalHandler;
 use crate::error::ToolError;
 use crate::message::Message;
-use crate::provider::LlmProvider;
+use crate::policy::{AllowList, IntersectPolicy};
+use crate::provider::{LlmProvider, ThinkingConfig};
+use crate::stream::StreamEvent;
 use crate::tool::{Tool, ToolContext, ToolOutput};
 
-/// Spawn a nested agent that reuses its parent's tool executor.
-///
-/// ## Design (Model 3)
-///
-/// `SubAgent` is **stateful**: it holds its own provider, model, and
-/// per-run limits, captured at construction. The LLM can only set the
-/// sub-agent's `prompt` and (optionally) override `system` per invocation
-/// — `model`, `max_turns`, `max_tokens` etc. are fixed so the parent
-/// agent can rely on predictable sub-agent behaviour.
-///
-/// At execute time the sub-agent builds a fresh [`Agent`] using the
-/// **parent's [`ToolExecutor`] from [`ToolContext`]** rather than a
-/// separately-configured toolset. This is the critical Model 3 property:
-/// a child automatically inherits the parent's full registry — custom
-/// tools, `WebFetch`, even another `SubAgent` instance — which enables
-/// multi-level nesting up to `max_depth` without any explicit layering
-/// or `Arc` cycles.
-///
-/// The child gets a cancellation token via [`tokio_util::sync::CancellationToken::child_token`],
-/// so cancelling the parent cascades; and `ctx.depth + 1` is enforced
-/// against `ctx.max_depth` to cap recursion.
+const DEFAULT_NAME: &str = "agent";
+const DEFAULT_DESCRIPTION: &str = "Spawn a sub-agent to handle a complex task autonomously. The sub-agent gets its own conversation context and inherits the parent agent's full tool set. Use this for tasks that require multi-step reasoning or focused exploration.";
+
+type TraceHook = Arc<dyn Fn(&StreamEvent) + Send + Sync>;
+
+/// Spawn a nested agent that reuses its parent's tool registry.
 pub struct SubAgent {
     provider: Arc<dyn LlmProvider>,
     model: String,
@@ -37,12 +28,20 @@ pub struct SubAgent {
     max_turns: usize,
     max_tokens: u32,
     temperature: Option<f32>,
+    name: String,
+    description: String,
+    tools_allow: Option<HashSet<String>>,
+    filter_tool_definitions: bool,
+    approval_handler: Option<Arc<dyn ApprovalHandler>>,
+    trace_hook: Option<TraceHook>,
+    thinking: Option<ThinkingConfig>,
 }
 
 impl SubAgent {
-    /// Construct a sub-agent tool. Provider and model are required; the
-    /// rest are sensible defaults you can override with the builder-style
-    /// setters.
+    /// Construct a sub-agent tool named `agent`.
+    ///
+    /// Register multiple specialised sub-agents by giving each one a unique
+    /// [`name`](Self::name). `AgentBuilder::build` rejects duplicate tool names.
     pub fn new(provider: Arc<dyn LlmProvider>, model: impl Into<String>) -> Self {
         Self {
             provider,
@@ -51,7 +50,24 @@ impl SubAgent {
             max_turns: 30,
             max_tokens: 4096,
             temperature: None,
+            name: DEFAULT_NAME.into(),
+            description: DEFAULT_DESCRIPTION.into(),
+            tools_allow: None,
+            filter_tool_definitions: false,
+            approval_handler: None,
+            trace_hook: None,
+            thinking: None,
         }
+    }
+
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
     }
 
     /// Default system prompt for the sub-agent. The LLM can override this
@@ -61,11 +77,13 @@ impl SubAgent {
         self
     }
 
+    /// Limit child loop turns. Default: 30.
     pub fn max_turns(mut self, max_turns: usize) -> Self {
         self.max_turns = max_turns;
         self
     }
 
+    /// Limit child output tokens per provider call. Default: 4096.
     pub fn max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
         self
@@ -75,19 +93,80 @@ impl SubAgent {
         self.temperature = Some(temperature);
         self
     }
+
+    /// Restrict the child to this tool allow-list, intersected with the
+    /// parent policy. Empty means no tools are allowed; unset means inherit all.
+    pub fn tools_allow<I, S>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.tools_allow = Some(tools.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Also hide disallowed tool definitions from the child LLM request.
+    ///
+    /// Default `false` preserves stable prompt-cache hashes; denied calls still
+    /// surface as tool-result errors through policy.
+    pub fn filter_tool_definitions(mut self, on: bool) -> Self {
+        self.filter_tool_definitions = on;
+        self
+    }
+
+    pub fn approval_handler(mut self, handler: Arc<dyn ApprovalHandler>) -> Self {
+        self.approval_handler = Some(handler);
+        self
+    }
+
+    pub fn trace_hook<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(&StreamEvent) + Send + Sync + 'static,
+    {
+        self.trace_hook = Some(Arc::new(hook));
+        self
+    }
+
+    pub fn thinking(mut self, config: ThinkingConfig) -> Self {
+        self.thinking = Some(config);
+        self
+    }
+
+    async fn run_with_trace(
+        &self,
+        agent: &Agent,
+        history: Vec<Message>,
+        cancel: CancellationToken,
+        hook: TraceHook,
+    ) -> Result<ToolOutput, ToolError> {
+        let mut stream = agent.stream(history, cancel);
+        while let Some(event) = stream.next().await {
+            if let Ok(ev) = event {
+                emit_trace_event(&hook, &ev);
+            }
+        }
+
+        match stream.into_result().await {
+            Ok(result) => Ok(ToolOutput::text(result.text)),
+            Err(e) => Ok(ToolOutput::error(format!("Sub-agent error: {e}"))),
+        }
+    }
+}
+
+fn emit_trace_event(hook: &TraceHook, ev: &StreamEvent) {
+    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (hook)(ev))) {
+        tracing::error!(?panic, "trace_hook closure panicked; suppressed");
+    }
 }
 
 #[async_trait]
 impl Tool for SubAgent {
     fn name(&self) -> &str {
-        "agent"
+        &self.name
     }
 
     fn description(&self) -> &str {
-        "Spawn a sub-agent to handle a complex task autonomously. \
-         The sub-agent gets its own conversation context and inherits \
-         the parent agent's full tool set. Use this for tasks that \
-         require multi-step reasoning or focused exploration."
+        &self.description
     }
 
     fn input_schema(&self) -> Value {
@@ -107,14 +186,6 @@ impl Tool for SubAgent {
         })
     }
 
-    /// `SubAgent` is the canonical recursive tool — its `execute` body
-    /// runs an entire nested `Agent::run` while the executor task that
-    /// dispatched it stays parked. The executor uses this signal to
-    /// route the call through the per-level-forked `concurrent_mut`
-    /// pool even when the consumer hasn't explicitly promoted `agent`
-    /// via `tool_concurrency`, avoiding the permanent stall that
-    /// would otherwise arise from holding a shared `serial_mut`
-    /// permit across the child's lifetime.
     fn is_recursive(&self) -> bool {
         true
     }
@@ -134,13 +205,16 @@ impl Tool for SubAgent {
         let system_override = input["system"].as_str().map(String::from);
         let system = system_override.or_else(|| self.system.clone());
 
-        // Fork the executor so the sub-agent runs with fresh
-        // concurrency-permit accounting. Same registry, policy, and
-        // approval — but independent semaphores. Without this fork,
-        // a parent batch saturating `concurrent_mut` with promoted
-        // `agent` calls would deadlock as soon as any child needed
-        // its own promoted-mutator slot.
-        let child_executor = ctx.executor.fork_for_subagent();
+        let policy_override = self.tools_allow.as_ref().map(|allow| {
+            Arc::new(IntersectPolicy {
+                left: ctx.executor.policy_arc_for_fork(),
+                right: Arc::new(AllowList::new(allow.iter().cloned())),
+            }) as Arc<dyn crate::executor::ToolPolicy>
+        });
+
+        let child_executor = ctx
+            .executor
+            .fork_for_subagent_with(policy_override, self.approval_handler.clone());
 
         let mut builder = Agent::builder()
             .provider_arc(Arc::clone(&self.provider))
@@ -158,14 +232,28 @@ impl Tool for SubAgent {
         if let Some(temp) = self.temperature {
             builder = builder.temperature(temp);
         }
+        if let Some(thinking) = self.thinking.clone() {
+            builder = builder.thinking(thinking);
+        }
+        if self.filter_tool_definitions {
+            if let Some(allow) = &self.tools_allow {
+                builder = builder.tool_definition_filter(allow.clone());
+            }
+        }
 
-        let agent = builder.build();
+        let agent = builder.build_unchecked();
         let child_cancel = ctx.cancel.child_token();
         let history = vec![Message::user_text(prompt)];
 
-        match agent.run(history, child_cancel).await {
-            Ok(result) => Ok(ToolOutput::text(result.text)),
-            Err(e) => Ok(ToolOutput::error(format!("Sub-agent error: {e}"))),
+        match &self.trace_hook {
+            Some(hook) => {
+                self.run_with_trace(&agent, history, child_cancel, Arc::clone(hook))
+                    .await
+            }
+            None => match agent.run(history, child_cancel).await {
+                Ok(result) => Ok(ToolOutput::text(result.text)),
+                Err(e) => Ok(ToolOutput::error(format!("Sub-agent error: {e}"))),
+            },
         }
     }
 }

@@ -74,7 +74,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .system("Answer in one short sentence.")
         .max_turns(1)
         .max_tokens(512)
-        .build();
+        .build()
+        .unwrap();
 
     let mut stream = agent.stream(
         vec![Message::user_text("What is 2+2?")],

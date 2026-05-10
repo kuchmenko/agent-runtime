@@ -24,7 +24,8 @@ async fn single_turn_text_response() {
         .provider(Mock::with_text("Hello, world!"))
         .model("test")
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(prompt("Hi"), CancellationToken::new())
@@ -69,7 +70,8 @@ async fn tool_call_then_text_response() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(prompt("run echo hello"), CancellationToken::new())
@@ -120,7 +122,8 @@ async fn multiple_tool_calls_single_response() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(prompt("run two commands"), CancellationToken::new())
@@ -155,7 +158,8 @@ async fn max_turns_exceeded() {
         .tools(tkach::tools::defaults())
         .max_turns(3)
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let err = agent
         .run(prompt("loop forever"), CancellationToken::new())
@@ -179,7 +183,8 @@ async fn cancel_before_run_returns_cancelled_immediately() {
         .provider(mock)
         .model("test")
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let cancel = CancellationToken::new();
     cancel.cancel();
@@ -232,7 +237,8 @@ async fn tool_not_found_returns_error_result() {
         .provider(mock)
         .model("test")
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(prompt("use a fake tool"), CancellationToken::new())
@@ -283,7 +289,8 @@ async fn usage_accumulates_across_turns() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(prompt("test"), CancellationToken::new())
@@ -334,7 +341,8 @@ async fn read_tool_reads_actual_file() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(prompt("read cargo toml"), CancellationToken::new())
@@ -384,7 +392,8 @@ async fn glob_tool_finds_files() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(prompt("find rust files"), CancellationToken::new())
@@ -445,7 +454,8 @@ async fn multi_turn_tool_chain() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(&tmp_dir)
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(prompt("update the file"), CancellationToken::new())
@@ -467,7 +477,8 @@ async fn no_tools_text_only() {
         .provider(Mock::with_text("I have no tools but I can chat!"))
         .model("test")
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(prompt("hello"), CancellationToken::new())
@@ -501,7 +512,8 @@ async fn end_turn_stops_even_with_tool_use_content() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(prompt("test"), CancellationToken::new())
@@ -542,7 +554,8 @@ async fn cancel_during_bash_tool_returns_cancelled() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
@@ -605,7 +618,8 @@ async fn provider_error_returns_partial() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let err = agent
         .run(prompt("test"), CancellationToken::new())
@@ -631,7 +645,8 @@ async fn stream_text_response_emits_delta_then_collects_result() {
         .provider(Mock::with_text("Hello, world!"))
         .model("test")
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let mut stream = agent.stream(prompt("hi"), CancellationToken::new());
     let mut events: Vec<StreamEvent> = Vec::new();
@@ -670,7 +685,8 @@ async fn stream_thinking_response_forwards_live_and_preserves_history() {
         }))
         .model("test")
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let mut stream = agent.stream(prompt("hi"), CancellationToken::new());
     let mut saw_delta = false;
@@ -752,7 +768,8 @@ async fn stream_redacted_thinking_preserves_metadata_without_visible_text() {
         }))
         .model("test")
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let mut stream = agent.stream(prompt("hi"), CancellationToken::new());
     let mut saw_redacted_block = false;
@@ -836,7 +853,8 @@ async fn stream_tool_call_then_text_response_executes_tool_inline() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let mut stream = agent.stream(prompt("run echo"), CancellationToken::new());
     let mut tool_use_seen = false;
@@ -866,7 +884,8 @@ async fn stream_collect_result_skips_event_drain() {
         .provider(Mock::with_text("ignored content"))
         .model("test")
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     // Don't iterate events; collect_result should still complete.
     let stream = agent.stream(prompt("hi"), CancellationToken::new());
@@ -883,7 +902,8 @@ async fn stream_cancel_before_start_returns_cancelled_via_into_result() {
         .provider(mock)
         .model("test")
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let cancel = CancellationToken::new();
     cancel.cancel();
@@ -931,7 +951,8 @@ async fn stream_emits_tool_call_pending_before_executing_tool() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let mut stream = agent.stream(prompt("run echo"), CancellationToken::new());
     let mut sequence: Vec<&'static str> = Vec::new();
@@ -1020,7 +1041,8 @@ async fn stream_with_deny_handler_emits_pending_but_skips_execution() {
         .tools(tkach::tools::defaults())
         .approval(DenyAll)
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let mut stream = agent.stream(prompt("run echo hi"), CancellationToken::new());
     let mut got_pending = false;
@@ -1050,4 +1072,149 @@ async fn stream_with_deny_handler_emits_pending_but_skips_execution() {
         saw_denial,
         "expected denial tool_result containing 'nope' in history"
     );
+}
+
+#[test]
+fn build_rejects_duplicate_tool_names() {
+    let err = match Agent::builder()
+        .provider(Mock::with_text("unused"))
+        .model("test")
+        .tool(tkach::tools::Read)
+        .tool(tkach::tools::Read)
+        .working_dir(test_dir())
+        .build()
+    {
+        Ok(_) => panic!("duplicate tool names must fail fast"),
+        Err(err) => err,
+    };
+
+    assert!(matches!(
+        err,
+        tkach::BuildError::DuplicateToolName { name, count }
+            if name == "read" && count == 2
+    ));
+}
+
+#[tokio::test]
+async fn builder_threads_thinking_to_provider_request() {
+    let mock = Mock::new(|req| {
+        assert_eq!(
+            req.thinking,
+            Some(tkach::ThinkingConfig::Effort(tkach::ThinkingEffort::High))
+        );
+        Ok(Response {
+            content: vec![Content::text("ok")],
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        })
+    });
+
+    let agent = Agent::builder()
+        .provider(mock)
+        .model("test")
+        .thinking(tkach::ThinkingConfig::Effort(tkach::ThinkingEffort::High))
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let result = agent
+        .run(prompt("hi"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(result.text, "ok");
+}
+
+#[tokio::test]
+async fn subagent_trace_hook_receives_child_stream_events() {
+    let trace_count = Arc::new(AtomicUsize::new(0));
+    let hook_count = Arc::clone(&trace_count);
+    let parent_turn = Arc::new(AtomicUsize::new(0));
+    let parent_turn_clone = Arc::clone(&parent_turn);
+
+    let parent = Mock::new(move |_| {
+        let turn = parent_turn_clone.fetch_add(1, Ordering::SeqCst);
+        if turn == 0 {
+            Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "sub-1".into(),
+                    name: "agent".into(),
+                    input: json!({"prompt": "answer inside child"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+        } else {
+            Ok(Response {
+                content: vec![Content::text("parent done")],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    });
+
+    let child = Arc::new(Mock::with_text("child done"));
+    let agent = Agent::builder()
+        .provider(parent)
+        .model("parent")
+        .tool(
+            tkach::tools::SubAgent::new(child, "child").trace_hook(move |_| {
+                hook_count.fetch_add(1, Ordering::SeqCst);
+            }),
+        )
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let result = agent
+        .run(prompt("delegate"), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(result.text, "parent done");
+    assert_eq!(trace_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn subagent_trace_hook_panic_does_not_fail_parent() {
+    let parent_turn = Arc::new(AtomicUsize::new(0));
+    let parent_turn_clone = Arc::clone(&parent_turn);
+
+    let parent = Mock::new(move |_| {
+        let turn = parent_turn_clone.fetch_add(1, Ordering::SeqCst);
+        if turn == 0 {
+            Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "sub-1".into(),
+                    name: "agent".into(),
+                    input: json!({"prompt": "answer inside child"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+        } else {
+            Ok(Response {
+                content: vec![Content::text("parent recovered")],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    });
+
+    let child = Arc::new(Mock::with_text("child done"));
+    let agent = Agent::builder()
+        .provider(parent)
+        .model("parent")
+        .tool(tkach::tools::SubAgent::new(child, "child").trace_hook(|_| {
+            panic!("trace sink failed");
+        }))
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let result = agent
+        .run(prompt("delegate"), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(result.text, "parent recovered");
 }

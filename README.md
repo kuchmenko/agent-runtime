@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
         .model(tkach::model::claude::HAIKU_20251001)
         .system("You are a concise assistant.")
         .tools(tools::defaults())
-        .build();
+        .build()?;
 
     let mut history = vec![Message::user_text(
         "List the .rs files in this directory and summarise each.",
@@ -349,10 +349,36 @@ let agent = Agent::builder()
     .model(tkach::model::claude::HAIKU_20251001)
     .tools(tools::defaults())
     .approval(MyApproval)
-    .build();
+    .build()?;
 ```
 
 `Deny(reason)` flows back to the model as `is_error: true` tool_result so the LLM can adapt — it is **not** an `AgentError`. The runtime races `approve()` against `cancel.cancelled()`, so an outer cancel always wins over a hung UI handler.
+
+## Specialised SubAgents
+
+`SubAgent::new(provider, model)` still registers the default `agent` tool. For multiple children, give each one a unique tool name; `AgentBuilder::build()` returns `BuildError::DuplicateToolName` instead of silently shadowing a prior registration.
+
+```rust
+use std::sync::Arc;
+use tkach::{Agent, ThinkingConfig, ThinkingEffort, providers::Anthropic, tools::SubAgent};
+
+let haiku = Arc::new(Anthropic::from_env());
+let research = SubAgent::new(haiku, tkach::model::claude::HAIKU_20251001)
+    .name("research")
+    .description("Read-only research helper")
+    .tools_allow(["read", "glob", "grep", "web_fetch"])
+    .filter_tool_definitions(true)
+    .thinking(ThinkingConfig::Effort(ThinkingEffort::High));
+
+let agent = Agent::builder()
+    .provider(Anthropic::from_env())
+    .model(tkach::model::claude::SONNET)
+    .tools(tkach::tools::defaults())
+    .tool(research)
+    .build()?;
+```
+
+Tool scoping is an intersection with the parent policy: a child allow-list can remove capability, never re-add a tool denied by the parent. Leave `filter_tool_definitions(false)` to keep prompt-cache hashes stable and let denied calls return tool-result errors; enable it when the child should not even see disallowed tools.
 
 ## Custom tools
 
@@ -377,7 +403,7 @@ impl Tool for CurrentTime {
 let agent = Agent::builder()
     .provider(...)
     .tool(CurrentTime)
-    .build();
+    .build()?;
 ```
 
 Long-running tools should `tokio::select!` on `ctx.cancel.cancelled()` and return `ToolError::Cancelled` promptly — the loop trusts the contract and does not race tools at the outer level.
@@ -392,6 +418,7 @@ Each runnable demo also asserts its invariants — `cargo run --example NAME` ei
 - [`streaming_anthropic_adaptive_thinking.rs`](./examples/streaming_anthropic_adaptive_thinking.rs) — Anthropic adaptive-thinking stream; asserts positive thinking blocks.
 - [`streaming_multi_tool.rs`](./examples/streaming_multi_tool.rs) — Multi-turn write→edit→read chain via `Agent::stream`.
 - [`streaming_subagent.rs`](./examples/streaming_subagent.rs) — Sonnet streams, delegates to a Haiku sub-agent.
+- [`specialised_subagents.rs`](./examples/specialised_subagents.rs) — Named child tool with an allow-list and per-call thinking override.
 - [`streaming_openai_tools.rs`](./examples/streaming_openai_tools.rs) — OpenAI-compatible tool call + no-thinking contract through Chat Completions.
 - [`streaming_openai_responses_thinking.rs`](./examples/streaming_openai_responses_thinking.rs) — OpenAI Responses reasoning-summary stream; asserts positive thinking blocks.
 - [`streaming_openai_codex.rs`](./examples/streaming_openai_codex.rs) — ChatGPT Codex subscription stream; reasoning summary + atomic tool calls.

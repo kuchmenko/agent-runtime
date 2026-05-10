@@ -757,6 +757,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             temperature: Some(0.5),
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -782,6 +783,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -802,6 +804,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -826,6 +829,7 @@ mod tests {
             }],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -846,6 +850,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -873,6 +878,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -901,6 +907,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -925,6 +932,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -1141,6 +1149,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -1165,6 +1174,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();

@@ -128,7 +128,8 @@ async fn main() {
         // The promotion that unblocks parallelism. Without it, the two
         // writes would route to the width-1 serial-mutator pool.
         .tool_concurrency("slow_write", ToolConcurrency::on())
-        .build();
+        .build()
+        .unwrap();
 
     let started = Instant::now();
     let result = agent
