@@ -19,6 +19,7 @@ use serde_json::Value;
 
 use crate::error::ProviderError;
 use crate::message::{StopReason, ThinkingMetadata, ThinkingProvider, Usage};
+use crate::steering::TurnId;
 use crate::tool::ToolClass;
 
 /// One unit of progress from a streaming provider.
@@ -31,6 +32,9 @@ use crate::tool::ToolClass;
 /// arrives once at the end. `Done` is the terminal marker.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
+    /// Agent-level event fired when a new turn starts.
+    TurnStarted { turn_id: TurnId },
+
     /// A piece of assistant text. Concatenate in order to reconstruct
     /// the full reply.
     ContentDelta(String),

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -18,6 +19,7 @@ use crate::executor::{
 };
 use crate::message::{CacheControl, Content, Message, StopReason, Usage};
 use crate::provider::{LlmProvider, Request, SystemBlock, ThinkingConfig, ToolDefinition};
+use crate::steering::{self, AgentControl, SteerCommand, TurnId};
 use crate::stream::StreamEvent;
 use crate::tool::{Tool, ToolContext};
 
@@ -175,6 +177,30 @@ impl Agent {
         messages: Vec<Message>,
         cancel: CancellationToken,
     ) -> Result<AgentResult, AgentError> {
+        let (future, _handle) = self.run_with_handle(messages, cancel);
+        future.await
+    }
+
+    pub fn run_with_handle(
+        &self,
+        messages: Vec<Message>,
+        cancel: CancellationToken,
+    ) -> (
+        impl Future<Output = Result<AgentResult, AgentError>> + Send + 'static,
+        crate::AgentHandle,
+    ) {
+        let agent = self.clone();
+        let (control, handle) = steering::control_pair(cancel.clone());
+        let future = async move { agent.run_loop(messages, cancel, control).await };
+        (future, handle)
+    }
+
+    async fn run_loop(
+        self,
+        messages: Vec<Message>,
+        cancel: CancellationToken,
+        mut control: AgentControl,
+    ) -> Result<AgentResult, AgentError> {
         let mut history = messages;
         let mut new_messages: Vec<Message> = Vec::new();
         let mut total_usage = Usage::default();
@@ -187,7 +213,8 @@ impl Agent {
         let ctx = self.make_context(cancel.clone());
 
         for turn in 0..self.max_turns {
-            info!(turn, "agent turn");
+            let turn_id = begin_turn(&control, turn);
+            info!(turn, %turn_id, "agent turn");
 
             if cancel.is_cancelled() {
                 return Err(AgentError::Cancelled {
@@ -245,6 +272,7 @@ impl Agent {
                 info!(turn, "agent finished");
                 // Safe to unwrap: we just assigned `Some` above when this
                 // response was decoded.
+                clear_active_turn(&control);
                 return Ok(AgentResult {
                     new_messages,
                     text,
@@ -264,11 +292,19 @@ impl Agent {
             }
 
             debug!(count = tool_calls.len(), "executing tool batch");
-            let results = self.executor.execute_batch(tool_calls, &ctx).await;
+            let results = self
+                .executor
+                .execute_batch_with_tracker(
+                    tool_calls,
+                    &ctx,
+                    Some(control.handle_inner.tool_runs.clone()),
+                )
+                .await;
 
             let user_msg = Message::user(results);
             history.push(user_msg.clone());
             new_messages.push(user_msg);
+            drain_queued_user_messages(&mut control, &mut history, &mut new_messages);
 
             // If cancel fired while tools were running, skip the next
             // provider round-trip — cooperative tools have already returned
@@ -281,6 +317,7 @@ impl Agent {
             }
         }
 
+        clear_active_turn(&control);
         Err(AgentError::MaxTurnsReached {
             turns: self.max_turns,
             partial: build_partial(
@@ -318,6 +355,15 @@ impl Agent {
     /// shrink the TCP receive window, all the way back to the LLM
     /// server.
     pub fn stream(&self, messages: Vec<Message>, cancel: CancellationToken) -> AgentStream {
+        let (stream, _handle) = self.stream_with_handle(messages, cancel);
+        stream
+    }
+
+    pub fn stream_with_handle(
+        &self,
+        messages: Vec<Message>,
+        cancel: CancellationToken,
+    ) -> (AgentStream, crate::AgentHandle) {
         self.stream_internal(messages, cancel, None)
     }
 
@@ -335,7 +381,8 @@ impl Agent {
         cancel: CancellationToken,
         hook: TraceHook,
     ) -> AgentStream {
-        self.stream_internal(messages, cancel, Some(hook))
+        let (stream, _handle) = self.stream_internal(messages, cancel, Some(hook));
+        stream
     }
 
     fn stream_internal(
@@ -343,24 +390,28 @@ impl Agent {
         messages: Vec<Message>,
         cancel: CancellationToken,
         trace_hook: Option<TraceHook>,
-    ) -> AgentStream {
+    ) -> (AgentStream, crate::AgentHandle) {
         let agent = self.clone();
+        let (control, handle) = steering::control_pair(cancel.clone());
         let (events_tx, events_rx) = mpsc::channel::<Result<StreamEvent, ProviderError>>(16);
         let (result_tx, result_rx) = oneshot::channel();
 
         tokio::spawn(async move {
             let result = agent
-                .run_streaming_loop(messages, cancel, events_tx, trace_hook)
+                .run_streaming_loop(messages, cancel, control, events_tx, trace_hook)
                 .await;
             // If the consumer dropped before we finished, sending the
             // result is a no-op; that's fine.
             let _ = result_tx.send(result);
         });
 
-        AgentStream {
-            events_rx: ReceiverStream::new(events_rx),
-            result_rx: Some(result_rx),
-        }
+        (
+            AgentStream {
+                events_rx: ReceiverStream::new(events_rx),
+                result_rx: Some(result_rx),
+            },
+            handle,
+        )
     }
 
     /// Body of the streaming loop. Owns the task locally so the public
@@ -372,6 +423,7 @@ impl Agent {
         self,
         messages: Vec<Message>,
         cancel: CancellationToken,
+        mut control: AgentControl,
         events_tx: mpsc::Sender<Result<StreamEvent, ProviderError>>,
         trace_hook: Option<TraceHook>,
     ) -> Result<AgentResult, AgentError> {
@@ -384,7 +436,19 @@ impl Agent {
         let ctx = self.make_context(cancel.clone());
 
         for turn in 0..self.max_turns {
-            info!(turn, "agent stream turn");
+            let turn_id = begin_turn(&control, turn);
+            info!(turn, %turn_id, "agent stream turn");
+            let turn_event = StreamEvent::TurnStarted {
+                turn_id: turn_id.clone(),
+            };
+            if let Some(hook) = &trace_hook {
+                emit_trace(hook, &turn_event);
+            }
+            if events_tx.send(Ok(turn_event)).await.is_err() {
+                return Err(AgentError::Cancelled {
+                    partial: build_partial(&new_messages, &total_usage, StopReason::Cancelled, ""),
+                });
+            }
 
             if cancel.is_cancelled() {
                 return Err(AgentError::Cancelled {
@@ -603,10 +667,10 @@ impl Agent {
                         }
                         break;
                     }
-                    // ToolCallPending is an agent-emitted event and
-                    // should never arrive from a provider's stream.
-                    // Ignore defensively if a buggy provider injects it.
-                    StreamEvent::ToolCallPending { .. } => {}
+                    // Agent-emitted events should never arrive from a
+                    // provider's stream. Ignore defensively if a buggy
+                    // provider injects one.
+                    StreamEvent::TurnStarted { .. } | StreamEvent::ToolCallPending { .. } => {}
                 }
             }
             if !current_text_buf.is_empty() {
@@ -626,6 +690,7 @@ impl Agent {
 
             if tool_uses.is_empty() || resolved_stop == StopReason::EndTurn {
                 info!(turn, "agent stream finished");
+                clear_active_turn(&control);
                 return Ok(AgentResult {
                     new_messages,
                     text: turn_text,
@@ -681,10 +746,18 @@ impl Agent {
                 }
             }
 
-            let results = self.executor.execute_batch(calls, &ctx).await;
+            let results = self
+                .executor
+                .execute_batch_with_tracker(
+                    calls,
+                    &ctx,
+                    Some(control.handle_inner.tool_runs.clone()),
+                )
+                .await;
             let user_msg = Message::user(results);
             history.push(user_msg.clone());
             new_messages.push(user_msg);
+            drain_queued_user_messages(&mut control, &mut history, &mut new_messages);
 
             if cancel.is_cancelled() {
                 return Err(AgentError::Cancelled {
@@ -693,6 +766,7 @@ impl Agent {
             }
         }
 
+        clear_active_turn(&control);
         warn!(turns = self.max_turns, "agent stream max turns");
         Err(AgentError::MaxTurnsReached {
             turns: self.max_turns,
@@ -703,6 +777,45 @@ impl Agent {
                 "",
             ),
         })
+    }
+}
+
+fn begin_turn(control: &AgentControl, turn: usize) -> TurnId {
+    let turn_id = TurnId::new();
+    *control
+        .handle_inner
+        .active_turn
+        .write()
+        .expect("agent handle turn lock poisoned") = Some(turn_id.clone());
+    debug!(turn, %turn_id, "active turn set");
+    turn_id
+}
+
+fn clear_active_turn(control: &AgentControl) {
+    *control
+        .handle_inner
+        .active_turn
+        .write()
+        .expect("agent handle turn lock poisoned") = None;
+}
+
+fn drain_queued_user_messages(
+    control: &mut AgentControl,
+    history: &mut Vec<Message>,
+    new_messages: &mut Vec<Message>,
+) {
+    let mut content = Vec::new();
+    while let Ok(command) = control.steer_rx.try_recv() {
+        match command {
+            SteerCommand::Append {
+                content: mut queued,
+            } => content.append(&mut queued),
+        }
+    }
+    if !content.is_empty() {
+        let message = Message::user(content);
+        history.push(message.clone());
+        new_messages.push(message);
     }
 }
 

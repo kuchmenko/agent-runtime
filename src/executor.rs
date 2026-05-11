@@ -61,6 +61,7 @@ use tracing::warn;
 
 use crate::approval::{ApprovalDecision, ApprovalHandler, AutoApprove};
 use crate::message::Content;
+use crate::steering::ToolRunTracker;
 use crate::tool::{Tool, ToolClass, ToolContext};
 
 /// A single tool invocation decoded from an LLM `tool_use` block.
@@ -600,6 +601,15 @@ impl ToolExecutor {
     /// tool_use→tool_result invariant the agent loop relies on is
     /// preserved.
     pub async fn execute_batch(&self, calls: Vec<ToolCall>, ctx: &ToolContext) -> Vec<Content> {
+        self.execute_batch_with_tracker(calls, ctx, None).await
+    }
+
+    pub(crate) async fn execute_batch_with_tracker(
+        &self,
+        calls: Vec<ToolCall>,
+        ctx: &ToolContext,
+        tracker: Option<ToolRunTracker>,
+    ) -> Vec<Content> {
         if calls.is_empty() {
             return Vec::new();
         }
@@ -619,8 +629,15 @@ impl ToolExecutor {
                 break;
             }
             let j = same_class_run_end(&routings, i);
-            self.dispatch_run(&mut calls, &mut slots, &routings, i..j, ctx)
-                .await;
+            self.dispatch_run(
+                &mut calls,
+                &mut slots,
+                &routings,
+                i..j,
+                ctx,
+                tracker.clone(),
+            )
+            .await;
             i = j;
         }
 
@@ -640,13 +657,14 @@ impl ToolExecutor {
         routings: &[RoutingClass],
         range: std::ops::Range<usize>,
         ctx: &ToolContext,
+        tracker: Option<ToolRunTracker>,
     ) {
         let mut futs = FuturesUnordered::new();
         for k in range {
             let call = calls[k]
                 .take()
                 .expect("each slot taken exactly once during dispatch");
-            futs.push(self.dispatch_one(k, call, routings[k], ctx));
+            futs.push(self.dispatch_one(k, call, routings[k], ctx, tracker.clone()));
         }
         while let Some((idx, content)) = futs.next().await {
             slots[idx] = Some(content);
@@ -695,6 +713,7 @@ impl ToolExecutor {
         call: ToolCall,
         routing: RoutingClass,
         ctx: &ToolContext,
+        tracker: Option<ToolRunTracker>,
     ) -> (usize, Content) {
         if matches!(routing, RoutingClass::ShortCircuit) {
             return (idx, self.short_circuit_result(&call));
@@ -708,7 +727,16 @@ impl ToolExecutor {
             None => return (idx, cancelled_before_execution(&call.id)),
         };
 
-        let content = self.execute_one(call, ctx).await;
+        let call_id = call.id.clone();
+        let child_cancel = ctx.cancel.child_token();
+        if let Some(tracker) = &tracker {
+            tracker.register(&call_id, child_cancel.clone());
+        }
+        let child_ctx = ctx.with_cancel(child_cancel);
+        let content = self.execute_one(call, &child_ctx).await;
+        if let Some(tracker) = &tracker {
+            tracker.mark_done(&call_id);
+        }
         (idx, content)
     }
 

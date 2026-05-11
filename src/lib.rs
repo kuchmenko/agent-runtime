@@ -33,11 +33,13 @@ pub mod agent;
 pub mod approval;
 pub mod error;
 pub mod executor;
+pub mod handle;
 pub mod message;
 pub mod model;
 pub mod policy;
 pub mod provider;
 pub mod providers;
+pub mod steering;
 pub mod stream;
 pub mod tool;
 pub mod tools;
@@ -49,6 +51,7 @@ pub use error::{AgentError, ProviderError, ToolError};
 pub use executor::{
     AllowAll, ConcurrencyConfig, ToolCall, ToolConcurrency, ToolExecutor, ToolPolicy, ToolRegistry,
 };
+pub use handle::AgentHandle;
 pub use message::{
     CacheControl, CacheTtl, Content, Message, Role, StopReason, ThinkingMetadata, ThinkingProvider,
     Usage,
@@ -56,6 +59,10 @@ pub use message::{
 pub use policy::{AllowList, IntersectPolicy};
 pub use provider::{
     LlmProvider, Request, Response, SystemBlock, ThinkingConfig, ThinkingEffort, ToolDefinition,
+};
+pub use steering::{
+    InterruptError, InterruptOutcome, InterruptReason, InterruptTarget, IntoQueueContent,
+    SteerError, TurnId,
 };
 pub use stream::{ProviderEventStream, StreamEvent};
 pub use tokio_util::sync::CancellationToken;
