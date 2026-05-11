@@ -764,7 +764,12 @@ impl ToolExecutor {
             })
         }));
         match decision {
-            Ok(ModeDecision::Allow) | Err(_) => None,
+            Ok(ModeDecision::Allow) => None,
+            Err(_) => Some(Content::tool_result(
+                &call.id,
+                format!("Error: mode gate panicked for tool '{}'", call.name),
+                true,
+            )),
             Ok(ModeDecision::Deny { reason }) => Some(Content::tool_result(
                 &call.id,
                 format!("Error: mode denied tool '{}' — {reason}", call.name),

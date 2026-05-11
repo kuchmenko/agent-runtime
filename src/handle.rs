@@ -39,19 +39,23 @@ impl AgentHandle {
             .ok_or(SteerError::NoActiveTurn)?;
 
         if let Some(expected) = expected_turn_id {
-            if expected != active {
+            if expected != active.id {
                 return Err(SteerError::ExpectedTurnMismatch {
                     expected,
-                    actual: active,
+                    actual: active.id,
                 });
             }
         }
 
+        let turn_id = active.id;
         self.inner
             .steer_tx
-            .send(SteerCommand::Append { content })
+            .send(SteerCommand::Append {
+                turn_id: turn_id.clone(),
+                content,
+            })
             .map_err(|_| SteerError::ChannelClosed)?;
-        Ok(active)
+        Ok(turn_id)
     }
 
     /// Interrupt a tool, turn, or the whole session.
@@ -67,21 +71,14 @@ impl AgentHandle {
                     .read()
                     .expect("agent handle turn lock poisoned")
                     .clone();
-                if active.as_ref() != Some(&turn_id) {
+                let Some(active) = active else {
+                    return Ok(InterruptOutcome::NotInFlight);
+                };
+                if active.id != turn_id {
                     return Err(InterruptError::UnknownTurn(turn_id));
                 }
-                if let Some(cancel) = self
-                    .inner
-                    .active_turn_cancel
-                    .read()
-                    .expect("agent handle turn cancel lock poisoned")
-                    .as_ref()
-                {
-                    cancel.cancel();
-                    Ok(InterruptOutcome::Cancelled)
-                } else {
-                    Ok(InterruptOutcome::NotInFlight)
-                }
+                active.cancel.cancel();
+                Ok(InterruptOutcome::Cancelled)
             }
             InterruptTarget::Session => {
                 self.inner.cancel.cancel();
@@ -96,7 +93,8 @@ impl AgentHandle {
             .active_turn
             .read()
             .expect("agent handle turn lock poisoned")
-            .clone()
+            .as_ref()
+            .map(|turn| turn.id.clone())
     }
 
     pub fn set_mode(
@@ -108,6 +106,11 @@ impl AgentHandle {
         match authority {
             ModeAuthority::Operator => {
                 *self.inner.mode.write().expect("agent mode lock poisoned") = mode;
+                *self
+                    .inner
+                    .pending_mode
+                    .write()
+                    .expect("pending mode lock poisoned") = None;
             }
             ModeAuthority::Agent => {
                 *self

@@ -4,7 +4,7 @@
 //! control messages into a running agent; the loop applies them only at safe
 //! boundaries so provider streams and tool executions are not mutated in place.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -86,7 +86,9 @@ impl IntoQueueContent for String {
 
 impl IntoQueueContent for Vec<Content> {
     fn into_queue_content(self) -> Vec<Content> {
-        self
+        self.into_iter()
+            .filter(|content| matches!(content, Content::Text { .. } | Content::Thinking { .. }))
+            .collect()
     }
 }
 
@@ -104,7 +106,10 @@ pub enum SteerError {
 
 #[derive(Debug, Clone)]
 pub enum SteerCommand {
-    Append { content: Vec<Content> },
+    Append {
+        turn_id: TurnId,
+        content: Vec<Content>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -149,7 +154,7 @@ pub(crate) struct ToolRunTracker {
 #[derive(Debug, Default)]
 struct ToolRunState {
     in_flight: HashMap<String, CancellationToken>,
-    completed: HashSet<String>,
+    completed: VecDeque<String>,
 }
 
 impl ToolRunTracker {
@@ -162,14 +167,18 @@ impl ToolRunTracker {
 
     pub(crate) fn register(&self, tool_call_id: &str, cancel: CancellationToken) {
         let mut state = self.inner.lock().expect("tool tracker lock poisoned");
-        state.completed.remove(tool_call_id);
+        state.completed.retain(|id| id != tool_call_id);
         state.in_flight.insert(tool_call_id.to_string(), cancel);
     }
 
     pub(crate) fn mark_done(&self, tool_call_id: &str) {
         let mut state = self.inner.lock().expect("tool tracker lock poisoned");
         state.in_flight.remove(tool_call_id);
-        state.completed.insert(tool_call_id.to_string());
+        state.completed.retain(|id| id != tool_call_id);
+        state.completed.push_back(tool_call_id.to_string());
+        while state.completed.len() > 256 {
+            state.completed.pop_front();
+        }
     }
 
     pub(crate) fn interrupt(&self, tool_call_id: &str) -> InterruptOutcome {
@@ -177,7 +186,7 @@ impl ToolRunTracker {
         if let Some(cancel) = state.in_flight.get(tool_call_id) {
             cancel.cancel();
             InterruptOutcome::Cancelled
-        } else if state.completed.contains(tool_call_id) {
+        } else if state.completed.iter().any(|id| id == tool_call_id) {
             InterruptOutcome::AlreadyDone
         } else {
             InterruptOutcome::NotInFlight
@@ -185,9 +194,14 @@ impl ToolRunTracker {
     }
 }
 
+#[derive(Clone)]
+pub struct ActiveTurn {
+    pub(crate) id: TurnId,
+    pub(crate) cancel: CancellationToken,
+}
+
 pub(crate) struct AgentHandleInner {
-    pub(crate) active_turn: RwLock<Option<TurnId>>,
-    pub(crate) active_turn_cancel: RwLock<Option<CancellationToken>>,
+    pub(crate) active_turn: RwLock<Option<ActiveTurn>>,
     pub(crate) steer_tx: mpsc::UnboundedSender<SteerCommand>,
     pub(crate) cancel: CancellationToken,
     pub(crate) tool_runs: ToolRunTracker,
@@ -216,7 +230,6 @@ pub(crate) fn control_pair(
     let (steer_tx, steer_rx) = mpsc::unbounded_channel();
     let inner = Arc::new(AgentHandleInner {
         active_turn: RwLock::new(None),
-        active_turn_cancel: RwLock::new(None),
         steer_tx,
         cancel,
         tool_runs: ToolRunTracker::new(),

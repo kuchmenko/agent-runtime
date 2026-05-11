@@ -20,7 +20,7 @@ use crate::executor::{
 use crate::guard::{AgentSnapshot, GuardEval, GuardTrigger};
 use crate::message::{CacheControl, Content, Message, StopReason, Usage};
 use crate::provider::{LlmProvider, Request, SystemBlock, ThinkingConfig, ToolDefinition};
-use crate::steering::{self, AgentControl, SteerCommand, TurnId};
+use crate::steering::{self, ActiveTurn, AgentControl, SteerCommand, TurnId};
 use crate::stream::StreamEvent;
 use crate::tool::{Tool, ToolContext};
 use crate::user_input::UserInputBridge;
@@ -219,7 +219,8 @@ impl Agent {
         let tool_defs = self.tool_definitions();
 
         for turn in 0..self.max_turns {
-            let (turn_id, turn_cancel) = begin_turn(&control, turn, &cancel);
+            let (turn_id, turn_cancel, _mode_event) = begin_turn(&control, turn, &cancel);
+            let _turn_cleanup = ActiveTurnCleanup(Arc::clone(&control.handle_inner));
             let ctx = self.make_context(turn_cancel);
             info!(turn, %turn_id, "agent turn");
 
@@ -239,7 +240,15 @@ impl Agent {
                 thinking: self.thinking.clone(),
             };
 
-            let response = match self.provider.complete(request).await {
+            let response = match tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => {
+                    return Err(AgentError::Cancelled {
+                        partial: build_partial(&new_messages, &total_usage, StopReason::Cancelled, ""),
+                    });
+                }
+                response = self.provider.complete(request) => response
+            } {
                 Ok(r) => r,
                 Err(source) => {
                     return Err(AgentError::Provider {
@@ -275,15 +284,19 @@ impl Agent {
                 .collect();
 
             if tool_calls.is_empty() || response.stop_reason == StopReason::EndTurn {
-                if inject_continuation_if_needed(
+                let before_drain = new_messages.len();
+                drain_queued_user_messages(&mut control, &turn_id, &mut history, &mut new_messages);
+                if new_messages.len() > before_drain {
+                    continue;
+                }
+                match inject_continuation_if_needed(
                     &control,
                     turn + 1,
                     &mut history,
                     &mut new_messages,
-                )
-                .is_some()
-                {
-                    continue;
+                ) {
+                    InjectOutcome::Continue(_) => continue,
+                    InjectOutcome::Abort(_) | InjectOutcome::None => {}
                 }
                 let text = extract_text(&response.content);
                 info!(turn, "agent finished");
@@ -322,7 +335,7 @@ impl Agent {
             let user_msg = Message::user(results);
             history.push(user_msg.clone());
             new_messages.push(user_msg);
-            drain_queued_user_messages(&mut control, &mut history, &mut new_messages);
+            drain_queued_user_messages(&mut control, &turn_id, &mut history, &mut new_messages);
 
             // If cancel fired while tools were running, skip the next
             // provider round-trip — cooperative tools have already returned
@@ -457,7 +470,8 @@ impl Agent {
         let tool_defs = self.tool_definitions();
 
         for turn in 0..self.max_turns {
-            let (turn_id, turn_cancel) = begin_turn(&control, turn, &cancel);
+            let (turn_id, turn_cancel, mode_event) = begin_turn(&control, turn, &cancel);
+            let _turn_cleanup = ActiveTurnCleanup(Arc::clone(&control.handle_inner));
             let ctx = self.make_context(turn_cancel);
             info!(turn, %turn_id, "agent stream turn");
             let turn_event = StreamEvent::TurnStarted {
@@ -470,6 +484,21 @@ impl Agent {
                 return Err(AgentError::Cancelled {
                     partial: build_partial(&new_messages, &total_usage, StopReason::Cancelled, ""),
                 });
+            }
+            if let Some(event) = mode_event {
+                if let Some(hook) = &trace_hook {
+                    emit_trace(hook, &event);
+                }
+                if events_tx.send(Ok(event)).await.is_err() {
+                    return Err(AgentError::Cancelled {
+                        partial: build_partial(
+                            &new_messages,
+                            &total_usage,
+                            StopReason::Cancelled,
+                            "",
+                        ),
+                    });
+                }
             }
 
             if cancel.is_cancelled() {
@@ -488,7 +517,15 @@ impl Agent {
                 thinking: self.thinking.clone(),
             };
 
-            let mut provider_stream = match self.provider.stream(request).await {
+            let mut provider_stream = match tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => {
+                    return Err(AgentError::Cancelled {
+                        partial: build_partial(&new_messages, &total_usage, StopReason::Cancelled, ""),
+                    });
+                }
+                stream = self.provider.stream(request) => stream
+            } {
                 Ok(s) => s,
                 Err(source) => {
                     return Err(AgentError::Provider {
@@ -526,7 +563,7 @@ impl Agent {
             loop {
                 let event = tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => {
+                    _ = ctx.cancel.cancelled() => {
                         return Err(AgentError::Cancelled {
                             partial: build_partial(
                                 &new_messages,
@@ -716,26 +753,49 @@ impl Agent {
             new_messages.push(assistant_msg);
 
             if tool_uses.is_empty() || resolved_stop == StopReason::EndTurn {
-                if let Some(event) = inject_continuation_if_needed(
+                let before_drain = new_messages.len();
+                drain_queued_user_messages(&mut control, &turn_id, &mut history, &mut new_messages);
+                if new_messages.len() > before_drain {
+                    continue;
+                }
+                match inject_continuation_if_needed(
                     &control,
                     turn + 1,
                     &mut history,
                     &mut new_messages,
                 ) {
-                    if let Some(hook) = &trace_hook {
-                        emit_trace(hook, &event);
+                    InjectOutcome::Continue(event) => {
+                        if let Some(hook) = &trace_hook {
+                            emit_trace(hook, &event);
+                        }
+                        if events_tx.send(Ok(event)).await.is_err() {
+                            return Err(AgentError::Cancelled {
+                                partial: build_partial(
+                                    &new_messages,
+                                    &total_usage,
+                                    StopReason::Cancelled,
+                                    &turn_text,
+                                ),
+                            });
+                        }
+                        continue;
                     }
-                    if events_tx.send(Ok(event)).await.is_err() {
-                        return Err(AgentError::Cancelled {
-                            partial: build_partial(
-                                &new_messages,
-                                &total_usage,
-                                StopReason::Cancelled,
-                                &turn_text,
-                            ),
-                        });
+                    InjectOutcome::Abort(event) => {
+                        if let Some(hook) = &trace_hook {
+                            emit_trace(hook, &event);
+                        }
+                        if events_tx.send(Ok(event)).await.is_err() {
+                            return Err(AgentError::Cancelled {
+                                partial: build_partial(
+                                    &new_messages,
+                                    &total_usage,
+                                    StopReason::Cancelled,
+                                    &turn_text,
+                                ),
+                            });
+                        }
                     }
-                    continue;
+                    InjectOutcome::None => {}
                 }
                 info!(turn, "agent stream finished");
                 clear_active_turn(&control);
@@ -806,7 +866,7 @@ impl Agent {
             let user_msg = Message::user(results);
             history.push(user_msg.clone());
             new_messages.push(user_msg);
-            drain_queued_user_messages(&mut control, &mut history, &mut new_messages);
+            drain_queued_user_messages(&mut control, &turn_id, &mut history, &mut new_messages);
 
             if cancel.is_cancelled() {
                 return Err(AgentError::Cancelled {
@@ -833,22 +893,20 @@ fn begin_turn(
     control: &AgentControl,
     turn: usize,
     cancel: &CancellationToken,
-) -> (TurnId, CancellationToken) {
+) -> (TurnId, CancellationToken, Option<StreamEvent>) {
     let turn_id = TurnId::new();
     let turn_cancel = cancel.child_token();
     *control
         .handle_inner
         .active_turn
         .write()
-        .expect("agent handle turn lock poisoned") = Some(turn_id.clone());
-    *control
-        .handle_inner
-        .active_turn_cancel
-        .write()
-        .expect("agent handle turn cancel lock poisoned") = Some(turn_cancel.clone());
-    apply_pending_mode(control);
+        .expect("agent handle turn lock poisoned") = Some(ActiveTurn {
+        id: turn_id.clone(),
+        cancel: turn_cancel.clone(),
+    });
+    let mode_event = apply_pending_mode(control);
     debug!(turn, %turn_id, "active turn set");
-    (turn_id, turn_cancel)
+    (turn_id, turn_cancel, mode_event)
 }
 
 fn current_mode(control: &AgentControl) -> Arc<dyn crate::mode::AgentMode> {
@@ -883,17 +941,29 @@ fn apply_pending_mode(control: &AgentControl) -> Option<StreamEvent> {
     })
 }
 
+struct ActiveTurnCleanup(Arc<steering::AgentHandleInner>);
+
+impl Drop for ActiveTurnCleanup {
+    fn drop(&mut self) {
+        clear_active_turn_inner(&self.0);
+    }
+}
+
 fn clear_active_turn(control: &AgentControl) {
-    *control
-        .handle_inner
+    clear_active_turn_inner(&control.handle_inner);
+}
+
+fn clear_active_turn_inner(inner: &steering::AgentHandleInner) {
+    *inner
         .active_turn
         .write()
         .expect("agent handle turn lock poisoned") = None;
-    *control
-        .handle_inner
-        .active_turn_cancel
-        .write()
-        .expect("agent handle turn cancel lock poisoned") = None;
+}
+
+enum InjectOutcome {
+    Continue(StreamEvent),
+    Abort(StreamEvent),
+    None,
 }
 
 fn inject_continuation_if_needed(
@@ -901,7 +971,7 @@ fn inject_continuation_if_needed(
     turn_count: usize,
     history: &mut Vec<Message>,
     new_messages: &mut Vec<Message>,
-) -> Option<StreamEvent> {
+) -> InjectOutcome {
     let snapshot = AgentSnapshot {
         turn_count,
         last_assistant_message: new_messages
@@ -926,22 +996,23 @@ fn inject_continuation_if_needed(
                 let message = Message::user_text(prompt);
                 history.push(message.clone());
                 new_messages.push(message);
-                return Some(StreamEvent::ContinuationInjected {
+                return InjectOutcome::Continue(StreamEvent::ContinuationInjected {
                     guard_name,
                     iteration,
                 });
             }
             GuardEval::Abort { guard_name, reason } => {
-                return Some(StreamEvent::GuardAborted { guard_name, reason });
+                return InjectOutcome::Abort(StreamEvent::GuardAborted { guard_name, reason });
             }
             GuardEval::Stop => {}
         }
     }
-    None
+    InjectOutcome::None
 }
 
 fn drain_queued_user_messages(
     control: &mut AgentControl,
+    turn_id: &TurnId,
     history: &mut Vec<Message>,
     new_messages: &mut Vec<Message>,
 ) {
@@ -949,8 +1020,10 @@ fn drain_queued_user_messages(
     while let Ok(command) = control.steer_rx.try_recv() {
         match command {
             SteerCommand::Append {
+                turn_id: command_turn_id,
                 content: mut queued,
-            } => content.append(&mut queued),
+            } if command_turn_id == *turn_id => content.append(&mut queued),
+            SteerCommand::Append { .. } => {}
         }
     }
     if !content.is_empty() {
