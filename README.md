@@ -305,8 +305,10 @@ while let Some(event) = stream.next().await {
             // Agent-emitted: render an "approval pending" prompt in the UI.
             // Fires after ToolUse, before the executor's approval gate runs.
         }
-        StreamEvent::Done => break,
-        _ => {}                                  // MessageDelta, Usage
+        // MessageDelta, Usage, Done are absorbed by the agent loop and
+        // not forwarded on the public stream. The loop ends naturally
+        // when the channel closes; collect the final result below.
+        _ => {}
     }
 }
 
@@ -379,6 +381,18 @@ let agent = Agent::builder()
 ```
 
 Tool scoping is an intersection with the parent policy: a child allow-list can remove capability, never re-add a tool denied by the parent. Leave `filter_tool_definitions(false)` to keep prompt-cache hashes stable and let denied calls return tool-result errors; enable it when the child should not even see disallowed tools.
+
+**Mutating SubAgents must set `trace_hook`.** A child whose `tools_allow` includes `edit`, `write`, or `bash` writes user data — its decisions need per-turn parent observability. Without a trace, the parent receives only a single opaque summary and loses the implicit decision trail. This is Cognition AI's "Share full agent traces, not just individual messages" principle ([Don't build multi-agents](https://cognition.ai/blog/dont-build-multi-agents); [follow-up](https://cognition.ai/blog/multi-agents-working) on read-vs-write distinction). Read-only profiles ship safely without `trace_hook`; mutating profiles register one wired to an audit sink.
+
+```rust
+let writer = SubAgent::new(provider, tkach::model::claude::SONNET)
+    .name("writer")
+    .description("Mutating writer with full trace observability")
+    .tools_allow(["read", "edit", "write", "bash"])
+    .trace_hook(move |ev| audit_sink.record(ev));
+```
+
+See [`examples/specialised_subagents.rs`](./examples/specialised_subagents.rs) for the three canonical profiles registered side-by-side: read-only research, autonomous reasoning with `approval_handler(AutoApprove)`, and mutating writer with `trace_hook`.
 
 ## Custom tools
 
