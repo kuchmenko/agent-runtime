@@ -232,7 +232,7 @@ impl Agent {
 
             let request = Request {
                 model: self.model.clone(),
-                system: self.system.clone(),
+                system: system_with_mode(&self.system, &control),
                 messages: history.clone(),
                 tools: tool_defs.clone(),
                 max_tokens: self.max_tokens,
@@ -292,6 +292,7 @@ impl Agent {
                 match inject_continuation_if_needed(
                     &control,
                     turn + 1,
+                    &[GuardTrigger::OnTurnEnd, GuardTrigger::OnSessionStop],
                     &mut history,
                     &mut new_messages,
                 ) {
@@ -336,12 +337,21 @@ impl Agent {
             history.push(user_msg.clone());
             new_messages.push(user_msg);
             drain_queued_user_messages(&mut control, &turn_id, &mut history, &mut new_messages);
+            match inject_continuation_if_needed(
+                &control,
+                turn + 1,
+                &[GuardTrigger::OnTurnEnd],
+                &mut history,
+                &mut new_messages,
+            ) {
+                InjectOutcome::Continue(_) => continue,
+                InjectOutcome::Abort(_) | InjectOutcome::None => {}
+            }
 
-            // If cancel fired while tools were running, skip the next
-            // provider round-trip — cooperative tools have already returned
-            // Cancelled error results, and another LLM call would only be
-            // wasted tokens before the pre-turn check stops us anyway.
-            if cancel.is_cancelled() {
+            // If turn/session cancel fired while tools were running, skip the
+            // next provider round-trip — cooperative tools have already
+            // returned Cancelled error results.
+            if ctx.cancel.is_cancelled() || cancel.is_cancelled() {
                 return Err(AgentError::Cancelled {
                     partial: build_partial(&new_messages, &total_usage, StopReason::Cancelled, ""),
                 });
@@ -509,7 +519,7 @@ impl Agent {
 
             let request = Request {
                 model: self.model.clone(),
-                system: self.system.clone(),
+                system: system_with_mode(&self.system, &control),
                 messages: history.clone(),
                 tools: tool_defs.clone(),
                 max_tokens: self.max_tokens,
@@ -761,6 +771,7 @@ impl Agent {
                 match inject_continuation_if_needed(
                     &control,
                     turn + 1,
+                    &[GuardTrigger::OnTurnEnd, GuardTrigger::OnSessionStop],
                     &mut history,
                     &mut new_messages,
                 ) {
@@ -867,8 +878,32 @@ impl Agent {
             history.push(user_msg.clone());
             new_messages.push(user_msg);
             drain_queued_user_messages(&mut control, &turn_id, &mut history, &mut new_messages);
+            match inject_continuation_if_needed(
+                &control,
+                turn + 1,
+                &[GuardTrigger::OnTurnEnd],
+                &mut history,
+                &mut new_messages,
+            ) {
+                InjectOutcome::Continue(event) | InjectOutcome::Abort(event) => {
+                    if let Some(hook) = &trace_hook {
+                        emit_trace(hook, &event);
+                    }
+                    if events_tx.send(Ok(event)).await.is_err() {
+                        return Err(AgentError::Cancelled {
+                            partial: build_partial(
+                                &new_messages,
+                                &total_usage,
+                                StopReason::Cancelled,
+                                "",
+                            ),
+                        });
+                    }
+                }
+                InjectOutcome::None => {}
+            }
 
-            if cancel.is_cancelled() {
+            if ctx.cancel.is_cancelled() || cancel.is_cancelled() {
                 return Err(AgentError::Cancelled {
                     partial: build_partial(&new_messages, &total_usage, StopReason::Cancelled, ""),
                 });
@@ -903,10 +938,24 @@ fn begin_turn(
         .expect("agent handle turn lock poisoned") = Some(ActiveTurn {
         id: turn_id.clone(),
         cancel: turn_cancel.clone(),
+        accepting_steer: true,
     });
     let mode_event = apply_pending_mode(control);
     debug!(turn, %turn_id, "active turn set");
     (turn_id, turn_cancel, mode_event)
+}
+
+fn system_with_mode(
+    base: &Option<Vec<SystemBlock>>,
+    control: &AgentControl,
+) -> Option<Vec<SystemBlock>> {
+    let addendum = current_mode(control).system_prompt_addendum();
+    if addendum.is_empty() {
+        return base.clone();
+    }
+    let mut system = base.clone().unwrap_or_default();
+    system.push(SystemBlock::text(addendum.into_owned()));
+    Some(system)
 }
 
 fn current_mode(control: &AgentControl) -> Arc<dyn crate::mode::AgentMode> {
@@ -969,6 +1018,7 @@ enum InjectOutcome {
 fn inject_continuation_if_needed(
     control: &AgentControl,
     turn_count: usize,
+    triggers: &[GuardTrigger],
     history: &mut Vec<Message>,
     new_messages: &mut Vec<Message>,
 ) -> InjectOutcome {
@@ -986,8 +1036,8 @@ fn inject_continuation_if_needed(
         .guards
         .write()
         .expect("continuation guard lock poisoned");
-    for trigger in [GuardTrigger::OnTurnEnd, GuardTrigger::OnSessionStop] {
-        match guards.evaluate(trigger, &snapshot) {
+    for trigger in triggers {
+        match guards.evaluate(*trigger, &snapshot) {
             GuardEval::Continue {
                 guard_name,
                 prompt,
@@ -1016,6 +1066,16 @@ fn drain_queued_user_messages(
     history: &mut Vec<Message>,
     new_messages: &mut Vec<Message>,
 ) {
+    if let Some(active) = control
+        .handle_inner
+        .active_turn
+        .write()
+        .expect("agent handle turn lock poisoned")
+        .as_mut()
+    {
+        active.accepting_steer = false;
+    }
+
     let mut content = Vec::new();
     while let Ok(command) = control.steer_rx.try_recv() {
         match command {
@@ -1023,7 +1083,10 @@ fn drain_queued_user_messages(
                 turn_id: command_turn_id,
                 content: mut queued,
             } if command_turn_id == *turn_id => content.append(&mut queued),
-            SteerCommand::Append { .. } => {}
+            SteerCommand::Append { .. } => tracing::warn!(
+                %turn_id,
+                "discarding stale queued steering message for inactive turn"
+            ),
         }
     }
     if !content.is_empty() {

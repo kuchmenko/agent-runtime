@@ -34,20 +34,22 @@ impl AgentHandle {
             .inner
             .active_turn
             .read()
-            .expect("agent handle turn lock poisoned")
-            .clone()
-            .ok_or(SteerError::NoActiveTurn)?;
+            .expect("agent handle turn lock poisoned");
+        let active = active.as_ref().ok_or(SteerError::NoActiveTurn)?;
+        if !active.accepting_steer {
+            return Err(SteerError::NoActiveTurn);
+        }
 
         if let Some(expected) = expected_turn_id {
             if expected != active.id {
                 return Err(SteerError::ExpectedTurnMismatch {
                     expected,
-                    actual: active.id,
+                    actual: active.id.clone(),
                 });
             }
         }
 
-        let turn_id = active.id;
+        let turn_id = active.id.clone();
         self.inner
             .steer_tx
             .send(SteerCommand::Append {

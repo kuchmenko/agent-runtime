@@ -198,6 +198,7 @@ impl ToolRunTracker {
 pub struct ActiveTurn {
     pub(crate) id: TurnId,
     pub(crate) cancel: CancellationToken,
+    pub(crate) accepting_steer: bool,
 }
 
 pub(crate) struct AgentHandleInner {
