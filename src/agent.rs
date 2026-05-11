@@ -52,6 +52,10 @@ pub enum BuildError {
     DuplicateToolName { name: String, count: usize },
 }
 
+/// Type alias for the per-event trace hook used by `stream_with_trace_hook`
+/// and the SubAgent execute path.
+pub(crate) type TraceHook = Arc<dyn Fn(&StreamEvent) + Send + Sync>;
+
 #[derive(Debug, Clone)]
 pub struct AgentResult {
     /// Messages appended by this run only — **not** the full history.
@@ -314,12 +318,40 @@ impl Agent {
     /// shrink the TCP receive window, all the way back to the LLM
     /// server.
     pub fn stream(&self, messages: Vec<Message>, cancel: CancellationToken) -> AgentStream {
+        self.stream_internal(messages, cancel, None)
+    }
+
+    /// Streaming variant that also fires `trace_hook` for **every**
+    /// `StreamEvent` observed by the loop — including
+    /// `MessageDelta`, `Usage`, `Done`, and the agent-emitted
+    /// `ToolCallPending`. The public stream channel keeps its
+    /// existing contract (Done is the terminal marker on that channel
+    /// and is NOT forwarded). Used by [`crate::tools::SubAgent`] when
+    /// `trace_hook` is set so per-turn observability is lossless
+    /// without changing public stream semantics.
+    pub(crate) fn stream_with_trace_hook(
+        &self,
+        messages: Vec<Message>,
+        cancel: CancellationToken,
+        hook: TraceHook,
+    ) -> AgentStream {
+        self.stream_internal(messages, cancel, Some(hook))
+    }
+
+    fn stream_internal(
+        &self,
+        messages: Vec<Message>,
+        cancel: CancellationToken,
+        trace_hook: Option<TraceHook>,
+    ) -> AgentStream {
         let agent = self.clone();
         let (events_tx, events_rx) = mpsc::channel::<Result<StreamEvent, ProviderError>>(16);
         let (result_tx, result_rx) = oneshot::channel();
 
         tokio::spawn(async move {
-            let result = agent.run_streaming_loop(messages, cancel, events_tx).await;
+            let result = agent
+                .run_streaming_loop(messages, cancel, events_tx, trace_hook)
+                .await;
             // If the consumer dropped before we finished, sending the
             // result is a no-op; that's fine.
             let _ = result_tx.send(result);
@@ -341,6 +373,7 @@ impl Agent {
         messages: Vec<Message>,
         cancel: CancellationToken,
         events_tx: mpsc::Sender<Result<StreamEvent, ProviderError>>,
+        trace_hook: Option<TraceHook>,
     ) -> Result<AgentResult, AgentError> {
         let mut history = messages;
         let mut new_messages: Vec<Message> = Vec::new();
@@ -441,11 +474,11 @@ impl Agent {
                     StreamEvent::ContentDelta(delta) => {
                         turn_text.push_str(&delta);
                         current_text_buf.push_str(&delta);
-                        if events_tx
-                            .send(Ok(StreamEvent::ContentDelta(delta)))
-                            .await
-                            .is_err()
-                        {
+                        let ev = StreamEvent::ContentDelta(delta);
+                        if let Some(hook) = &trace_hook {
+                            emit_trace(hook, &ev);
+                        }
+                        if events_tx.send(Ok(ev)).await.is_err() {
                             // Consumer hung up — abort like a cancel.
                             return Err(AgentError::Cancelled {
                                 partial: build_partial(
@@ -458,11 +491,11 @@ impl Agent {
                         }
                     }
                     StreamEvent::ThinkingDelta { text } => {
-                        if events_tx
-                            .send(Ok(StreamEvent::ThinkingDelta { text }))
-                            .await
-                            .is_err()
-                        {
+                        let ev = StreamEvent::ThinkingDelta { text };
+                        if let Some(hook) = &trace_hook {
+                            emit_trace(hook, &ev);
+                        }
+                        if events_tx.send(Ok(ev)).await.is_err() {
                             return Err(AgentError::Cancelled {
                                 partial: build_partial(
                                     &new_messages,
@@ -487,15 +520,15 @@ impl Agent {
                             provider,
                             metadata: metadata.clone(),
                         });
-                        if events_tx
-                            .send(Ok(StreamEvent::ThinkingBlock {
-                                text,
-                                provider,
-                                metadata,
-                            }))
-                            .await
-                            .is_err()
-                        {
+                        let ev = StreamEvent::ThinkingBlock {
+                            text,
+                            provider,
+                            metadata,
+                        };
+                        if let Some(hook) = &trace_hook {
+                            emit_trace(hook, &ev);
+                        }
+                        if events_tx.send(Ok(ev)).await.is_err() {
                             return Err(AgentError::Cancelled {
                                 partial: build_partial(
                                     &new_messages,
@@ -522,11 +555,11 @@ impl Agent {
                             name: name.clone(),
                             input: input.clone(),
                         });
-                        if events_tx
-                            .send(Ok(StreamEvent::ToolUse { id, name, input }))
-                            .await
-                            .is_err()
-                        {
+                        let ev = StreamEvent::ToolUse { id, name, input };
+                        if let Some(hook) = &trace_hook {
+                            emit_trace(hook, &ev);
+                        }
+                        if events_tx.send(Ok(ev)).await.is_err() {
                             return Err(AgentError::Cancelled {
                                 partial: build_partial(
                                     &new_messages,
@@ -538,6 +571,14 @@ impl Agent {
                         }
                     }
                     StreamEvent::MessageDelta { stop_reason } => {
+                        // Forwarded only to the optional `trace_hook`
+                        // below; intentionally NOT forwarded on the
+                        // public `Agent::stream` channel because Done
+                        // (the event right after) is documented as the
+                        // terminal marker and consumers break on it.
+                        if let Some(hook) = &trace_hook {
+                            emit_trace(hook, &StreamEvent::MessageDelta { stop_reason });
+                        }
                         turn_stop = Some(stop_reason);
                     }
                     StreamEvent::Usage(u) => {
@@ -546,9 +587,22 @@ impl Agent {
                         // output_tokens). The provider re-stamps cache
                         // fields onto every emission so merge_max here
                         // keeps the correct values across both events.
+                        if let Some(hook) = &trace_hook {
+                            emit_trace(hook, &StreamEvent::Usage(u.clone()));
+                        }
                         turn_usage.merge_max(&u);
                     }
-                    StreamEvent::Done => break,
+                    StreamEvent::Done => {
+                        // Per-turn provider boundary, fired into the
+                        // trace_hook for full child observability per
+                        // issue #40 P6, but absorbed by the public
+                        // stream so `Done` keeps its documented
+                        // "stream terminated" terminal contract.
+                        if let Some(hook) = &trace_hook {
+                            emit_trace(hook, &StreamEvent::Done);
+                        }
+                        break;
+                    }
                     // ToolCallPending is an agent-emitted event and
                     // should never arrive from a provider's stream.
                     // Ignore defensively if a buggy provider injects it.
@@ -612,6 +666,9 @@ impl Agent {
                     input: call.input.clone(),
                     class,
                 };
+                if let Some(hook) = &trace_hook {
+                    emit_trace(hook, &event);
+                }
                 if events_tx.send(Ok(event)).await.is_err() {
                     return Err(AgentError::Cancelled {
                         partial: build_partial(
@@ -717,6 +774,15 @@ impl AgentStream {
                 }),
             })
         })
+    }
+}
+
+/// Fire a trace hook closure with panic isolation. A panicking hook is
+/// caught and logged, but the agent loop continues — an audit sink
+/// failure must not crash the agent.
+fn emit_trace(hook: &TraceHook, ev: &StreamEvent) {
+    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (hook)(ev))) {
+        tracing::error!(?panic, "trace_hook closure panicked; suppressed");
     }
 }
 
@@ -918,6 +984,12 @@ impl AgentBuilder {
         self
     }
 
+    /// Default per-call thinking config threaded into every
+    /// [`Request`] this agent issues. Provider precedence: an explicit
+    /// per-call `Request.thinking` (set by, for example, a SubAgent's
+    /// own [`crate::tools::SubAgent::thinking`]) overrides this; this
+    /// in turn overrides the provider instance's construction-time
+    /// default. See [`ThinkingConfig`] for provider-asymmetry notes.
     pub fn thinking(mut self, thinking: ThinkingConfig) -> Self {
         self.thinking = Some(thinking);
         self
@@ -1048,10 +1120,6 @@ impl AgentBuilder {
 
     pub fn build(self) -> Result<Agent, BuildError> {
         self.validate_tool_names()?;
-        Ok(self.build_unchecked())
-    }
-
-    pub(crate) fn build_unchecked(self) -> Agent {
         let executor = self.executor_override.unwrap_or_else(|| {
             let registry = Arc::new(ToolRegistry::new(self.tools));
             let policy: Arc<dyn ToolPolicy> = self.policy.unwrap_or_else(|| Arc::new(AllowAll));
@@ -1067,7 +1135,7 @@ impl AgentBuilder {
             ))
         });
 
-        Agent {
+        Ok(Agent {
             provider: self.provider.expect("provider is required"),
             model: self.model.expect("model is required"),
             system: self.system,
@@ -1083,7 +1151,7 @@ impl AgentBuilder {
             cache_tools: self.cache_tools,
             thinking: self.thinking,
             tool_definition_filter: self.tool_definition_filter,
-        }
+        })
     }
 
     fn validate_tool_names(&self) -> Result<(), BuildError> {

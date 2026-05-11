@@ -76,18 +76,49 @@ pub struct Request {
     pub thinking: Option<ThinkingConfig>,
 }
 
+/// Per-call thinking/reasoning configuration carried on [`Request`].
+///
+/// When set, this overrides the provider instance's construction-time
+/// default (e.g. [`super::providers::Anthropic::with_thinking_budget`]).
+/// Provider asymmetry: [`Self::Effort`] and [`Self::Disabled`] are
+/// honored by every provider that supports thinking; [`Self::Budget`]
+/// is **Anthropic-style** — OpenAI Responses and OpenAI Codex
+/// providers ignore it and apply their instance defaults instead. See
+/// the per-provider docstrings for the exact precedence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThinkingConfig {
+    /// Symbolic effort level. Each provider maps to its own native
+    /// scale (Anthropic adaptive effort, OpenAI `reasoning.effort`).
+    /// Portable across providers.
     Effort(ThinkingEffort),
+    /// Explicit thinking budget in tokens. Anthropic-style only.
+    /// OpenAI providers ignore this and fall back to their instance
+    /// reasoning configuration.
     Budget(u32),
+    /// Disable thinking for this call even when the provider instance
+    /// has it enabled. Drops the entire `thinking`/`reasoning` block
+    /// from the wire payload.
     Disabled,
 }
 
+/// Symbolic thinking effort tier. Per-call carrier — least common
+/// denominator across providers. Vendor-specific tiers (Anthropic
+/// `XHigh` / `Max`; future extensions) reach the wire via
+/// [`Self::Other`] which forwards verbatim and routes through each
+/// provider's case-insensitive `From<&str>` parse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThinkingEffort {
+    /// Low / minimal reasoning effort.
     Low,
+    /// Medium / balanced reasoning effort.
     Medium,
+    /// High / maximum standard reasoning effort.
     High,
+    /// Vendor-specific tier (e.g. `"xhigh"`, `"max"`). Forwarded
+    /// verbatim. Each provider's `From<&str>` parse resolves
+    /// recognised values to typed variants; unknown values are sent as
+    /// raw strings and the server may 4xx — that's the caller's
+    /// responsibility.
     Other(String),
 }
 
