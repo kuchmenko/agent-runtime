@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     API_VERSION, Anthropic, ApiRequest, ApiResponse, build_request_body_with_thinking,
-    classify_error, convert_response, parse_retry_after,
+    classify_error, convert_response, effective_thinking, parse_retry_after,
 };
 use crate::error::ProviderError;
 use crate::provider::{Request, Response};
@@ -333,7 +333,10 @@ impl Anthropic {
             .iter()
             .map(|r| RequestEntry {
                 custom_id: &r.custom_id,
-                params: build_request_body_with_thinking(&r.params, self.thinking.clone()),
+                params: build_request_body_with_thinking(
+                    &r.params,
+                    effective_thinking(&r.params, self.thinking.as_ref()),
+                ),
             })
             .collect();
         let body = CreateBatchBody { requests: entries };
@@ -608,6 +611,7 @@ mod tests {
                 tools: vec![],
                 max_tokens: 64,
                 temperature: None,
+                thinking: None,
             },
         }
     }

@@ -9,7 +9,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .model(tkach::model::claude::SONNET)
         .system("You are a helpful coding assistant. Be concise.")
         .tools(tools::defaults())
-        .build();
+        .build()
+        .unwrap();
 
     let history = vec![Message::user_text(
         "What files are in the current directory? List them.",

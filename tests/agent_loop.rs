@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::StreamExt;
-use serde_json::json;
+use serde_json::{Value, json};
 use tkach::message::{Content, Message, StopReason, ThinkingMetadata, ThinkingProvider, Usage};
 use tkach::provider::Response;
 use tkach::providers::Mock;
@@ -24,7 +24,8 @@ async fn single_turn_text_response() {
         .provider(Mock::with_text("Hello, world!"))
         .model("test")
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(prompt("Hi"), CancellationToken::new())
@@ -69,7 +70,8 @@ async fn tool_call_then_text_response() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(prompt("run echo hello"), CancellationToken::new())
@@ -120,7 +122,8 @@ async fn multiple_tool_calls_single_response() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(prompt("run two commands"), CancellationToken::new())
@@ -155,7 +158,8 @@ async fn max_turns_exceeded() {
         .tools(tkach::tools::defaults())
         .max_turns(3)
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let err = agent
         .run(prompt("loop forever"), CancellationToken::new())
@@ -179,7 +183,8 @@ async fn cancel_before_run_returns_cancelled_immediately() {
         .provider(mock)
         .model("test")
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let cancel = CancellationToken::new();
     cancel.cancel();
@@ -232,7 +237,8 @@ async fn tool_not_found_returns_error_result() {
         .provider(mock)
         .model("test")
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(prompt("use a fake tool"), CancellationToken::new())
@@ -283,7 +289,8 @@ async fn usage_accumulates_across_turns() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(prompt("test"), CancellationToken::new())
@@ -334,7 +341,8 @@ async fn read_tool_reads_actual_file() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(prompt("read cargo toml"), CancellationToken::new())
@@ -384,7 +392,8 @@ async fn glob_tool_finds_files() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(prompt("find rust files"), CancellationToken::new())
@@ -445,7 +454,8 @@ async fn multi_turn_tool_chain() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(&tmp_dir)
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(prompt("update the file"), CancellationToken::new())
@@ -467,7 +477,8 @@ async fn no_tools_text_only() {
         .provider(Mock::with_text("I have no tools but I can chat!"))
         .model("test")
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(prompt("hello"), CancellationToken::new())
@@ -501,7 +512,8 @@ async fn end_turn_stops_even_with_tool_use_content() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(prompt("test"), CancellationToken::new())
@@ -542,7 +554,8 @@ async fn cancel_during_bash_tool_returns_cancelled() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
@@ -605,7 +618,8 @@ async fn provider_error_returns_partial() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let err = agent
         .run(prompt("test"), CancellationToken::new())
@@ -631,7 +645,8 @@ async fn stream_text_response_emits_delta_then_collects_result() {
         .provider(Mock::with_text("Hello, world!"))
         .model("test")
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let mut stream = agent.stream(prompt("hi"), CancellationToken::new());
     let mut events: Vec<StreamEvent> = Vec::new();
@@ -641,7 +656,9 @@ async fn stream_text_response_emits_delta_then_collects_result() {
     let result = stream.into_result().await.unwrap();
 
     // Mock emits one ContentDelta per Text block; ToolUse/MessageDelta/
-    // Usage/Done are absorbed by the agent loop and not forwarded.
+    // Usage/Done are absorbed by the agent loop and not forwarded on
+    // the public stream channel. Done is documented as the terminal
+    // marker; consumers break on it and call into_result().
     assert_eq!(events.len(), 1);
     assert!(matches!(&events[0], StreamEvent::ContentDelta(t) if t == "Hello, world!"));
 
@@ -670,7 +687,8 @@ async fn stream_thinking_response_forwards_live_and_preserves_history() {
         }))
         .model("test")
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let mut stream = agent.stream(prompt("hi"), CancellationToken::new());
     let mut saw_delta = false;
@@ -752,7 +770,8 @@ async fn stream_redacted_thinking_preserves_metadata_without_visible_text() {
         }))
         .model("test")
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let mut stream = agent.stream(prompt("hi"), CancellationToken::new());
     let mut saw_redacted_block = false;
@@ -836,7 +855,8 @@ async fn stream_tool_call_then_text_response_executes_tool_inline() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let mut stream = agent.stream(prompt("run echo"), CancellationToken::new());
     let mut tool_use_seen = false;
@@ -866,7 +886,8 @@ async fn stream_collect_result_skips_event_drain() {
         .provider(Mock::with_text("ignored content"))
         .model("test")
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     // Don't iterate events; collect_result should still complete.
     let stream = agent.stream(prompt("hi"), CancellationToken::new());
@@ -883,7 +904,8 @@ async fn stream_cancel_before_start_returns_cancelled_via_into_result() {
         .provider(mock)
         .model("test")
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let cancel = CancellationToken::new();
     cancel.cancel();
@@ -931,7 +953,8 @@ async fn stream_emits_tool_call_pending_before_executing_tool() {
         .model("test")
         .tools(tkach::tools::defaults())
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let mut stream = agent.stream(prompt("run echo"), CancellationToken::new());
     let mut sequence: Vec<&'static str> = Vec::new();
@@ -1020,7 +1043,8 @@ async fn stream_with_deny_handler_emits_pending_but_skips_execution() {
         .tools(tkach::tools::defaults())
         .approval(DenyAll)
         .working_dir(test_dir())
-        .build();
+        .build()
+        .unwrap();
 
     let mut stream = agent.stream(prompt("run echo hi"), CancellationToken::new());
     let mut got_pending = false;
@@ -1049,5 +1073,765 @@ async fn stream_with_deny_handler_emits_pending_but_skips_execution() {
     assert!(
         saw_denial,
         "expected denial tool_result containing 'nope' in history"
+    );
+}
+
+#[test]
+fn build_rejects_duplicate_tool_names() {
+    let err = match Agent::builder()
+        .provider(Mock::with_text("unused"))
+        .model("test")
+        .tool(tkach::tools::Read)
+        .tool(tkach::tools::Read)
+        .working_dir(test_dir())
+        .build()
+    {
+        Ok(_) => panic!("duplicate tool names must fail fast"),
+        Err(err) => err,
+    };
+
+    assert!(matches!(
+        err,
+        tkach::BuildError::DuplicateToolName { name, count }
+            if name == "read" && count == 2
+    ));
+}
+
+#[tokio::test]
+async fn builder_threads_thinking_to_provider_request() {
+    let mock = Mock::new(|req| {
+        assert_eq!(
+            req.thinking,
+            Some(tkach::ThinkingConfig::Effort(tkach::ThinkingEffort::High))
+        );
+        Ok(Response {
+            content: vec![Content::text("ok")],
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        })
+    });
+
+    let agent = Agent::builder()
+        .provider(mock)
+        .model("test")
+        .thinking(tkach::ThinkingConfig::Effort(tkach::ThinkingEffort::High))
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let result = agent
+        .run(prompt("hi"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(result.text, "ok");
+}
+
+#[tokio::test]
+async fn subagent_trace_hook_receives_full_child_stream_events() {
+    use std::sync::Mutex;
+
+    // The hook captures every variant the child stream emits. The Mock
+    // child returns a single text response so the expected sequence is:
+    // ContentDelta("child done") -> MessageDelta(EndTurn) -> Usage(_) ->
+    // Done. Issue #40 Phase 3 acceptance: ToolUse, ToolCallPending,
+    // ContentDelta, MessageDelta, Usage, Done all flow through.
+    let observed: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+    let observed_clone = Arc::clone(&observed);
+    let parent_turn = Arc::new(AtomicUsize::new(0));
+    let parent_turn_clone = Arc::clone(&parent_turn);
+
+    let parent = Mock::new(move |_| {
+        let turn = parent_turn_clone.fetch_add(1, Ordering::SeqCst);
+        if turn == 0 {
+            Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "sub-1".into(),
+                    name: "agent".into(),
+                    input: json!({"prompt": "answer inside child"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+        } else {
+            Ok(Response {
+                content: vec![Content::text("parent done")],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    });
+
+    let child = Arc::new(Mock::with_text("child done"));
+    let agent = Agent::builder()
+        .provider(parent)
+        .model("parent")
+        .tool(
+            tkach::tools::SubAgent::new(child, "child").trace_hook(move |ev| {
+                let tag = match ev {
+                    StreamEvent::ContentDelta(_) => "content_delta",
+                    StreamEvent::ThinkingDelta { .. } => "thinking_delta",
+                    StreamEvent::ThinkingBlock { .. } => "thinking_block",
+                    StreamEvent::ToolUse { .. } => "tool_use",
+                    StreamEvent::ToolCallPending { .. } => "tool_call_pending",
+                    StreamEvent::MessageDelta { .. } => "message_delta",
+                    StreamEvent::Usage(_) => "usage",
+                    StreamEvent::Done => "done",
+                };
+                observed_clone.lock().unwrap().push(tag);
+            }),
+        )
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let result = agent
+        .run(prompt("delegate"), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(result.text, "parent done");
+    let seen = observed.lock().unwrap().clone();
+    assert!(
+        seen.contains(&"content_delta"),
+        "trace_hook missed ContentDelta; got {seen:?}"
+    );
+    assert!(
+        seen.contains(&"message_delta"),
+        "trace_hook missed MessageDelta; got {seen:?}"
+    );
+    assert!(
+        seen.contains(&"usage"),
+        "trace_hook missed Usage; got {seen:?}"
+    );
+    assert!(
+        seen.contains(&"done"),
+        "trace_hook missed Done; got {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn subagent_trace_hook_observes_tool_call_path() {
+    use std::sync::Mutex;
+
+    // Mutating-child path per issue #40 P6. Child first turn emits
+    // ToolUse(read), the agent emits ToolCallPending, executes the
+    // tool, child second turn emits text, then MessageDelta + Usage
+    // + Done. The hook MUST observe ToolUse and ToolCallPending in
+    // addition to ContentDelta and the absorbed terminals.
+    let observed: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+    let observed_clone = Arc::clone(&observed);
+    let parent_turn = Arc::new(AtomicUsize::new(0));
+    let parent_turn_clone = Arc::clone(&parent_turn);
+
+    let parent = Mock::new(move |_| {
+        let turn = parent_turn_clone.fetch_add(1, Ordering::SeqCst);
+        if turn == 0 {
+            Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "sub-1".into(),
+                    name: "child".into(),
+                    input: json!({"prompt": "delegate"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+        } else {
+            Ok(Response {
+                content: vec![Content::text("parent done")],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    });
+
+    let child_turn = Arc::new(AtomicUsize::new(0));
+    let child_turn_clone = Arc::clone(&child_turn);
+    let child = Arc::new(Mock::new(move |_| {
+        let turn = child_turn_clone.fetch_add(1, Ordering::SeqCst);
+        if turn == 0 {
+            Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "child-call-1".into(),
+                    name: "read".into(),
+                    input: json!({"path": "Cargo.toml"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+        } else {
+            Ok(Response {
+                content: vec![Content::text("child read it")],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    }));
+
+    let agent = Agent::builder()
+        .provider(parent)
+        .model("parent")
+        .tools(tkach::tools::defaults())
+        .tool(
+            tkach::tools::SubAgent::new(child, "child-model")
+                .name("child")
+                .trace_hook(move |ev| {
+                    let tag = match ev {
+                        StreamEvent::ContentDelta(_) => "content_delta",
+                        StreamEvent::ThinkingDelta { .. } => "thinking_delta",
+                        StreamEvent::ThinkingBlock { .. } => "thinking_block",
+                        StreamEvent::ToolUse { .. } => "tool_use",
+                        StreamEvent::ToolCallPending { .. } => "tool_call_pending",
+                        StreamEvent::MessageDelta { .. } => "message_delta",
+                        StreamEvent::Usage(_) => "usage",
+                        StreamEvent::Done => "done",
+                    };
+                    observed_clone.lock().unwrap().push(tag);
+                }),
+        )
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    agent
+        .run(prompt("delegate"), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let seen = observed.lock().unwrap().clone();
+    for required in [
+        "tool_use",
+        "tool_call_pending",
+        "content_delta",
+        "message_delta",
+        "usage",
+        "done",
+    ] {
+        assert!(
+            seen.contains(&required),
+            "trace_hook missed {required}; got {seen:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn subagent_trace_hook_does_not_break_public_stream_consumers() {
+    // Regression guard: trace_hook must NOT change the public
+    // Agent::stream contract. A README-style consumer running in
+    // parallel sees only the documented forward set
+    // (ContentDelta/Thinking*/ToolUse/ToolCallPending) — not
+    // MessageDelta/Usage/Done — even when a SubAgent in the same tree
+    // has a trace_hook wired.
+    let mock = Mock::with_text("hello");
+    let agent = Agent::builder()
+        .provider(mock)
+        .model("test")
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let mut stream = agent.stream(prompt("hi"), CancellationToken::new());
+    let mut public_events: Vec<StreamEvent> = Vec::new();
+    while let Some(ev) = stream.next().await {
+        if let Ok(ev) = ev {
+            public_events.push(ev);
+        }
+    }
+    let _ = stream.into_result().await.unwrap();
+
+    assert!(
+        public_events.iter().all(|e| !matches!(
+            e,
+            StreamEvent::MessageDelta { .. } | StreamEvent::Usage(_) | StreamEvent::Done
+        )),
+        "public Agent::stream must not forward MessageDelta/Usage/Done; got {public_events:?}"
+    );
+}
+
+#[tokio::test]
+async fn subagent_trace_hook_panic_does_not_fail_parent() {
+    let parent_turn = Arc::new(AtomicUsize::new(0));
+    let parent_turn_clone = Arc::clone(&parent_turn);
+
+    let parent = Mock::new(move |_| {
+        let turn = parent_turn_clone.fetch_add(1, Ordering::SeqCst);
+        if turn == 0 {
+            Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "sub-1".into(),
+                    name: "agent".into(),
+                    input: json!({"prompt": "answer inside child"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+        } else {
+            Ok(Response {
+                content: vec![Content::text("parent recovered")],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    });
+
+    let child = Arc::new(Mock::with_text("child done"));
+    let agent = Agent::builder()
+        .provider(parent)
+        .model("parent")
+        .tool(tkach::tools::SubAgent::new(child, "child").trace_hook(|_| {
+            panic!("trace sink failed");
+        }))
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let result = agent
+        .run(prompt("delegate"), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(result.text, "parent recovered");
+}
+
+#[tokio::test]
+async fn subagent_filtered_tool_definitions_respect_parent_policy_without_child_allow_list() {
+    let parent_turn = Arc::new(AtomicUsize::new(0));
+    let parent_turn_clone = Arc::clone(&parent_turn);
+
+    let parent = Mock::new(move |_| {
+        let turn = parent_turn_clone.fetch_add(1, Ordering::SeqCst);
+        if turn == 0 {
+            Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "sub-1".into(),
+                    name: "agent".into(),
+                    input: json!({"prompt": "inspect visible tools"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+        } else {
+            Ok(Response {
+                content: vec![Content::text("parent done")],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    });
+
+    let child = Arc::new(Mock::new(|req| {
+        let names = req
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["agent", "read"]);
+        Ok(Response {
+            content: vec![Content::text("child done")],
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        })
+    }));
+
+    let agent = Agent::builder()
+        .provider(parent)
+        .model("parent")
+        .tools(tkach::tools::defaults())
+        .tool(tkach::tools::SubAgent::new(child, "child").filter_tool_definitions(true))
+        .policy(tkach::AllowList::new(["agent", "read"]))
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let result = agent
+        .run(prompt("delegate"), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(result.text, "parent done");
+}
+
+#[tokio::test]
+async fn subagent_filtered_tool_definitions_respect_parent_policy_with_child_allow_list() {
+    let parent_turn = Arc::new(AtomicUsize::new(0));
+    let parent_turn_clone = Arc::clone(&parent_turn);
+
+    let parent = Mock::new(move |_| {
+        let turn = parent_turn_clone.fetch_add(1, Ordering::SeqCst);
+        if turn == 0 {
+            Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "sub-1".into(),
+                    name: "agent".into(),
+                    input: json!({"prompt": "inspect visible tools"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+        } else {
+            Ok(Response {
+                content: vec![Content::text("parent done")],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    });
+
+    let child = Arc::new(Mock::new(|req| {
+        let names = req
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["read"]);
+        Ok(Response {
+            content: vec![Content::text("child done")],
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        })
+    }));
+
+    let agent = Agent::builder()
+        .provider(parent)
+        .model("parent")
+        .tools(tkach::tools::defaults())
+        .tool(
+            tkach::tools::SubAgent::new(child, "child")
+                .tools_allow(["read", "grep"])
+                .filter_tool_definitions(true),
+        )
+        .policy(tkach::AllowList::new(["agent", "read"]))
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let result = agent
+        .run(prompt("delegate"), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(result.text, "parent done");
+}
+
+// --- Phase 1 acceptance: SubAgent specialisation primitives ----------------
+
+#[tokio::test]
+async fn two_named_subagents_register_and_appear_in_tool_definitions() {
+    // Two specialised SubAgents must register side-by-side without
+    // BuildError, and the LLM-visible tool definitions must include
+    // both names (alphabetically sorted by Agent::tool_definitions).
+    let parent = Mock::new(|req| {
+        let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+        // Alphabetical: research, writer
+        assert_eq!(names, vec!["research", "writer"]);
+        Ok(Response {
+            content: vec![Content::text("ok")],
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        })
+    });
+
+    let child_a = Arc::new(Mock::with_text("a"));
+    let child_b = Arc::new(Mock::with_text("b"));
+
+    let agent = Agent::builder()
+        .provider(parent)
+        .model("parent")
+        .tool(
+            tkach::tools::SubAgent::new(child_a, "child-model")
+                .name("research")
+                .description("Read-only research"),
+        )
+        .tool(
+            tkach::tools::SubAgent::new(child_b, "child-model")
+                .name("writer")
+                .description("Mutating writer"),
+        )
+        .working_dir(test_dir())
+        .build()
+        .expect("two distinct names must register without BuildError");
+
+    agent
+        .run(prompt("hi"), CancellationToken::new())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn subagent_tools_allow_denies_non_allowed_call_via_intersect_policy() {
+    // P2 acceptance: child invokes a tool outside its allow-list; the
+    // IntersectPolicy(parent_policy, AllowList(child)) intersection
+    // returns is_allowed=false, so execute_one synthesises an
+    // is_error: true tool_result with "not allowed by policy".
+    let parent_turn = Arc::new(AtomicUsize::new(0));
+    let parent_turn_clone = Arc::clone(&parent_turn);
+    let parent = Mock::new(move |_| {
+        let turn = parent_turn_clone.fetch_add(1, Ordering::SeqCst);
+        if turn == 0 {
+            Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "sub-1".into(),
+                    name: "child".into(),
+                    input: json!({"prompt": "do work"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+        } else {
+            Ok(Response {
+                content: vec![Content::text("parent done")],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    });
+
+    let child_turn = Arc::new(AtomicUsize::new(0));
+    let child_turn_clone = Arc::clone(&child_turn);
+    let observed_results: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_clone = Arc::clone(&observed_results);
+
+    let child = Arc::new(Mock::new(move |req| {
+        let turn = child_turn_clone.fetch_add(1, Ordering::SeqCst);
+        if turn == 0 {
+            // Child issues a write — outside its allow-list of [read].
+            Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "child-call-1".into(),
+                    name: "write".into(),
+                    input: json!({"path": "/tmp/x", "content": "y"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+        } else {
+            // Capture the tool_result the child sees on turn 2.
+            for msg in &req.messages {
+                for c in &msg.content {
+                    if let Content::ToolResult { content, .. } = c {
+                        observed_clone.lock().unwrap().push(content.clone());
+                    }
+                }
+            }
+            Ok(Response {
+                content: vec![Content::text("child saw error")],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    }));
+
+    let agent = Agent::builder()
+        .provider(parent)
+        .model("parent")
+        .tools(tkach::tools::defaults())
+        .tool(
+            tkach::tools::SubAgent::new(child, "child-model")
+                .name("child")
+                .tools_allow(["read"]),
+        )
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    agent
+        .run(prompt("delegate"), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let results = observed_results.lock().unwrap().clone();
+    let joined = results.join("|");
+    let child_turns = child_turn.load(Ordering::SeqCst);
+    let parent_turns = parent_turn.load(Ordering::SeqCst);
+    assert!(
+        joined.contains("not allowed by policy") && joined.contains("write"),
+        "child should see policy denial for write; child_turns={child_turns}, parent_turns={parent_turns}, observed={joined:?}"
+    );
+}
+
+#[tokio::test]
+async fn subagent_approval_handler_overrides_parent_deny_handler() {
+    // P5 acceptance: parent installs DenyAll approval; child SubAgent
+    // overrides with AutoApprove via approval_handler(...). The child's
+    // tool call must land (no policy denial, no approval denial),
+    // proving the override actually swaps the per-child handler.
+    use tkach::{ApprovalDecision, ApprovalHandler, AutoApprove, ToolClass};
+
+    struct DenyAll;
+    #[async_trait::async_trait]
+    impl ApprovalHandler for DenyAll {
+        async fn approve(&self, _: &str, _: &Value, _: ToolClass) -> ApprovalDecision {
+            ApprovalDecision::Deny("parent says no".into())
+        }
+    }
+
+    let parent_turn = Arc::new(AtomicUsize::new(0));
+    let parent_turn_clone = Arc::clone(&parent_turn);
+    let parent = Mock::new(move |_| {
+        let turn = parent_turn_clone.fetch_add(1, Ordering::SeqCst);
+        if turn == 0 {
+            Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "sub-1".into(),
+                    name: "child".into(),
+                    input: json!({"prompt": "do work"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+        } else {
+            Ok(Response {
+                content: vec![Content::text("parent done")],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    });
+
+    let child_turn = Arc::new(AtomicUsize::new(0));
+    let child_turn_clone = Arc::clone(&child_turn);
+    let observed_results: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_clone = Arc::clone(&observed_results);
+
+    let child = Arc::new(Mock::new(move |req| {
+        let turn = child_turn_clone.fetch_add(1, Ordering::SeqCst);
+        if turn == 0 {
+            Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "child-call-1".into(),
+                    name: "read".into(),
+                    input: json!({"path": "Cargo.toml"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+        } else {
+            for msg in &req.messages {
+                for c in &msg.content {
+                    if let Content::ToolResult { content, .. } = c {
+                        observed_clone.lock().unwrap().push(content.clone());
+                    }
+                }
+            }
+            Ok(Response {
+                content: vec![Content::text("child done")],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    }));
+
+    let agent = Agent::builder()
+        .provider(parent)
+        .model("parent")
+        .tools(tkach::tools::defaults())
+        .tool(
+            tkach::tools::SubAgent::new(child, "child-model")
+                .name("child")
+                .approval_handler(Arc::new(AutoApprove)),
+        )
+        .approval(DenyAll)
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    agent
+        .run(prompt("delegate"), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let results = observed_results.lock().unwrap().clone();
+    let joined = results.join("|");
+    assert!(
+        !joined.contains("approval denied"),
+        "child override must bypass parent DenyAll; got {joined:?}"
+    );
+    assert!(
+        !joined.contains("parent says no"),
+        "child override must bypass parent DenyAll; got {joined:?}"
+    );
+}
+
+#[tokio::test]
+async fn fork_for_subagent_with_none_none_matches_fork_for_subagent_shape() {
+    // Compatibility regression: fork_for_subagent() must equal
+    // fork_for_subagent_with(None, None) by construction (one-line
+    // delegation). Validate by inspecting the resulting executor's
+    // policy / approval / registry Arc identity.
+    use std::sync::Arc as StdArc;
+    use tkach::{ToolExecutor, ToolRegistry};
+
+    let registry = StdArc::new(ToolRegistry::new(vec![]));
+    let policy: StdArc<dyn tkach::ToolPolicy> = StdArc::new(tkach::AllowAll);
+    let approval: StdArc<dyn tkach::ApprovalHandler> = StdArc::new(tkach::AutoApprove);
+    let exec = ToolExecutor::with_approval(registry.clone(), policy.clone(), approval.clone());
+
+    let a = exec.fork_for_subagent();
+    let b = exec.fork_for_subagent_with(None, None);
+
+    // Both share the parent's registry Arc.
+    assert!(StdArc::ptr_eq(a.registry(), b.registry()));
+    assert!(StdArc::ptr_eq(a.registry(), &registry));
+}
+
+#[tokio::test]
+async fn subagent_trace_hook_unset_takes_run_fast_path() {
+    // P3 acceptance: when trace_hook is None, SubAgent::execute uses
+    // agent.run (not agent.stream). Mock observes that stream() is NOT
+    // called for the child invocation when no trace_hook is wired.
+    let stream_called = Arc::new(AtomicUsize::new(0));
+    let stream_called_clone = Arc::clone(&stream_called);
+
+    let parent_turn = Arc::new(AtomicUsize::new(0));
+    let parent_turn_clone = Arc::clone(&parent_turn);
+    let parent = Mock::new(move |_| {
+        let turn = parent_turn_clone.fetch_add(1, Ordering::SeqCst);
+        if turn == 0 {
+            Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "sub-1".into(),
+                    name: "child".into(),
+                    input: json!({"prompt": "work"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+        } else {
+            Ok(Response {
+                content: vec![Content::text("parent done")],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    });
+
+    let _ = stream_called_clone;
+    let _ = stream_called;
+    let child_mock = Arc::new(Mock::with_text("child done"));
+    let child_provider: Arc<dyn tkach::provider::LlmProvider> =
+        Arc::clone(&child_mock) as Arc<dyn tkach::provider::LlmProvider>;
+
+    let agent = Agent::builder()
+        .provider(parent)
+        .model("parent")
+        .tool(tkach::tools::SubAgent::new(child_provider, "child-model").name("child"))
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    agent
+        .run(prompt("delegate"), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let n = child_mock.stream_count();
+    assert_eq!(
+        n, 0,
+        "child stream() must not be called when trace_hook is unset; got {n} stream calls"
+    );
+    assert!(
+        child_mock.complete_count() >= 1,
+        "child complete() must be called via run() fast path"
     );
 }

@@ -69,7 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_turns(8)
         .max_tokens(2048)
         .working_dir(&dir)
-        .build();
+        .build()
+        .unwrap();
 
     let started = Instant::now();
     let mut stream = agent.stream(

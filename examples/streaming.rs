@@ -29,7 +29,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .system("You are concise. Reply in 2-3 sentences.")
         .max_turns(1)
         .max_tokens(512)
-        .build();
+        .build()
+        .unwrap();
 
     let history = vec![Message::user_text(
         "In one paragraph, explain why streaming responses feel \

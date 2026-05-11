@@ -757,6 +757,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             temperature: Some(0.5),
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -782,6 +783,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -802,6 +804,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -826,6 +829,7 @@ mod tests {
             }],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -846,6 +850,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -873,6 +878,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -901,6 +907,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -925,6 +932,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -1141,6 +1149,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -1165,6 +1174,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -1173,5 +1183,30 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[1]["role"], "user");
+    }
+
+    #[test]
+    fn request_thinking_is_ignored_silently() {
+        // OpenAICompatible targets Chat Completions, which has no
+        // standard reasoning surface. The provider must ignore
+        // Request.thinking without panic, returning a body that
+        // contains no reasoning/thinking field. Issue #40 Phase 2
+        // acceptance.
+        use crate::provider::{ThinkingConfig, ThinkingEffort};
+        let req = Request {
+            model: "gpt-4o".into(),
+            system: None,
+            messages: vec![Message::user_text("hi")],
+            tools: vec![],
+            max_tokens: 10,
+            temperature: None,
+            thinking: Some(ThinkingConfig::Effort(ThinkingEffort::High)),
+        };
+        let body = build_request_body(&req);
+        let json = serde_json::to_value(&body).unwrap();
+        assert!(
+            json.get("reasoning").is_none() && json.get("thinking").is_none(),
+            "OpenAICompatible must not emit reasoning/thinking; got {json}"
+        );
     }
 }

@@ -51,6 +51,7 @@ fn haiku_agent(working_dir: &Path) -> Agent {
         .max_tokens(1024)
         .working_dir(working_dir)
         .build()
+        .unwrap()
 }
 
 fn sonnet_agent(working_dir: &Path) -> Agent {
@@ -70,6 +71,7 @@ fn sonnet_agent(working_dir: &Path) -> Agent {
         .max_tokens(4096)
         .working_dir(working_dir)
         .build()
+        .unwrap()
 }
 
 fn assert_tool_called(result: &AgentResult, tool_name: &str) {
@@ -143,7 +145,8 @@ async fn smoke_provider_roundtrip() {
         .system("Reply with exactly: PONG")
         .max_turns(1)
         .max_tokens(32)
-        .build();
+        .build()
+        .unwrap();
 
     let result = agent
         .run(prompt("PING"), CancellationToken::new())
@@ -481,6 +484,7 @@ async fn smoke_openai_compatible_roundtrip() {
         tools: vec![],
         max_tokens: 256,
         temperature: Some(0.0),
+        thinking: None,
     };
 
     let response = provider
@@ -539,6 +543,7 @@ async fn smoke_anthropic_stream_roundtrip() {
         tools: vec![],
         max_tokens: 32,
         temperature: Some(0.0),
+        thinking: None,
     };
 
     let mut stream = provider.stream(request).await.expect("open stream");
@@ -622,6 +627,7 @@ async fn smoke_openai_compatible_stream_roundtrip() {
         tools: vec![],
         max_tokens: 256,
         temperature: Some(0.0),
+        thinking: None,
     };
 
     let mut stream = provider.stream(request).await.expect("open stream");
@@ -696,6 +702,7 @@ async fn smoke_openai_responses_thinking_stream() {
         tools: vec![],
         max_tokens: 1024,
         temperature: None,
+        thinking: None,
     };
 
     let mut stream = provider

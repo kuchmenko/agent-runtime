@@ -67,7 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .system("You are a helpful assistant.")
         .tool(CurrentTime)
         .tools(tools::defaults())
-        .build();
+        .build()
+        .unwrap();
 
     let history = vec![Message::user_text("What time is it?")];
     let result = agent.run(history, CancellationToken::new()).await?;

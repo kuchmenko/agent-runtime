@@ -41,6 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tools: vec![],
                 max_tokens: 64,
                 temperature: Some(0.0),
+                thinking: None,
             },
         })
         .collect();

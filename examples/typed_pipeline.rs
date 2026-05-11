@@ -17,7 +17,8 @@ fn main() {
         .provider(anthropic)
         .model(claude::SONNET)
         .max_tokens(1024)
-        .build();
+        .build()
+        .unwrap();
 
     let openai = OpenAIResponses::new("sk-placeholder")
         .with_reasoning(OpenAIEffort::Medium, OpenAISummary::Detailed);
@@ -26,7 +27,8 @@ fn main() {
         .provider(openai)
         .model(gpt::FIVE)
         .max_tokens(1024)
-        .build();
+        .build()
+        .unwrap();
 
     drop((claude_agent, gpt_agent));
 }

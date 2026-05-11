@@ -10,7 +10,9 @@ use crate::error::ProviderError;
 use crate::message::{
     CacheControl, Content, StopReason, ThinkingMetadata, ThinkingProvider, Usage,
 };
-use crate::provider::{LlmProvider, Request, Response, SystemBlock};
+use crate::provider::{
+    LlmProvider, Request, Response, SystemBlock, ThinkingConfig, ThinkingEffort,
+};
 use crate::stream::{ProviderEventStream, StreamEvent};
 
 pub mod batch;
@@ -189,7 +191,10 @@ impl Anthropic {
 #[async_trait]
 impl LlmProvider for Anthropic {
     async fn stream(&self, request: Request) -> Result<ProviderEventStream, ProviderError> {
-        let mut body = build_request_body_with_thinking(&request, self.thinking.clone());
+        let mut body = build_request_body_with_thinking(
+            &request,
+            effective_thinking(&request, self.thinking.as_ref()),
+        );
         body.stream = true;
 
         let response = self
@@ -219,7 +224,10 @@ impl LlmProvider for Anthropic {
     }
 
     async fn complete(&self, request: Request) -> Result<Response, ProviderError> {
-        let body = build_request_body_with_thinking(&request, self.thinking.clone());
+        let body = build_request_body_with_thinking(
+            &request,
+            effective_thinking(&request, self.thinking.as_ref()),
+        );
 
         let response = self
             .client
@@ -796,6 +804,32 @@ pub(crate) fn build_request_body_with_thinking(
     }
 }
 
+fn effective_thinking(
+    request: &Request,
+    instance: Option<&AnthropicThinkingConfig>,
+) -> Option<AnthropicThinkingConfig> {
+    match &request.thinking {
+        Some(ThinkingConfig::Disabled) => None,
+        Some(ThinkingConfig::Budget(budget_tokens)) => Some(AnthropicThinkingConfig::Manual {
+            budget_tokens: *budget_tokens,
+        }),
+        Some(ThinkingConfig::Effort(effort)) => Some(AnthropicThinkingConfig::Adaptive {
+            effort: Some(map_thinking_effort(effort)),
+            display: AnthropicThinkingDisplay::Summarized,
+        }),
+        None => instance.cloned(),
+    }
+}
+
+fn map_thinking_effort(effort: &ThinkingEffort) -> AnthropicEffort {
+    match effort {
+        ThinkingEffort::Low => AnthropicEffort::Low,
+        ThinkingEffort::Medium => AnthropicEffort::Medium,
+        ThinkingEffort::High => AnthropicEffort::High,
+        ThinkingEffort::Other(value) => AnthropicEffort::from(value.as_str()),
+    }
+}
+
 fn api_thinking_config(config: &AnthropicThinkingConfig) -> ApiThinkingConfig {
     match config {
         AnthropicThinkingConfig::Manual { budget_tokens } => ApiThinkingConfig {
@@ -945,6 +979,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             temperature: None,
+            thinking: None,
         }
     }
 
@@ -1042,6 +1077,7 @@ mod tests {
             ],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -1064,6 +1100,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -1087,6 +1124,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -1104,6 +1142,7 @@ mod tests {
             tools: vec![],
             max_tokens: 2048,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body_with_thinking(
             &req,
@@ -1127,6 +1166,7 @@ mod tests {
             tools: vec![],
             max_tokens: 2048,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body_with_thinking(
             &req,
@@ -1152,6 +1192,7 @@ mod tests {
             tools: vec![],
             max_tokens: 2048,
             temperature: Some(0.2),
+            thinking: None,
         };
         let body = build_request_body_with_thinking(
             &req,
@@ -1180,6 +1221,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -1205,6 +1247,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -1244,6 +1287,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -1270,6 +1314,7 @@ mod tests {
             tools: vec![],
             max_tokens: 10,
             temperature: None,
+            thinking: None,
         };
         let body = build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -1515,5 +1560,72 @@ mod tests {
         assert_eq!(last.input_tokens, 50);
         assert_eq!(last.output_tokens, 75);
         assert_eq!(last.cache_read_input_tokens, 1000);
+    }
+}
+
+#[cfg(test)]
+mod thinking_override_tests {
+    use super::*;
+    use crate::provider::{ThinkingConfig, ThinkingEffort};
+
+    fn request(thinking: Option<ThinkingConfig>) -> Request {
+        Request {
+            model: "claude-test".into(),
+            system: None,
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 100,
+            temperature: Some(0.2),
+            thinking,
+        }
+    }
+
+    #[test]
+    fn request_budget_overrides_instance_default() {
+        let req = request(Some(ThinkingConfig::Budget(2048)));
+        let effective = effective_thinking(
+            &req,
+            Some(&AnthropicThinkingConfig::Adaptive {
+                effort: Some(AnthropicEffort::Low),
+                display: AnthropicThinkingDisplay::Summarized,
+            }),
+        );
+        let body = build_request_body_with_thinking(&req, effective);
+        let json = serde_json::to_value(body).unwrap();
+        assert_eq!(json["thinking"]["type"], "enabled");
+        assert_eq!(json["thinking"]["budget_tokens"], 2048);
+        assert!(json.get("temperature").is_none());
+    }
+
+    #[test]
+    fn request_effort_other_uses_anthropic_parse() {
+        let req = request(Some(ThinkingConfig::Effort(ThinkingEffort::Other(
+            "XHIGH".into(),
+        ))));
+        let body = build_request_body_with_thinking(&req, effective_thinking(&req, None));
+        let json = serde_json::to_value(body).unwrap();
+        assert_eq!(json["thinking"]["type"], "adaptive");
+        assert_eq!(json["output_config"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn request_disabled_omits_instance_default() {
+        let req = request(Some(ThinkingConfig::Disabled));
+        let body = build_request_body_with_thinking(
+            &req,
+            effective_thinking(
+                &req,
+                Some(&AnthropicThinkingConfig::Manual {
+                    budget_tokens: 1024,
+                }),
+            ),
+        );
+        let json = serde_json::to_value(body).unwrap();
+        assert!(json.get("thinking").is_none());
+        assert!(
+            json["temperature"]
+                .as_f64()
+                .is_some_and(|v| (v - 0.2).abs() < 1e-6)
+        );
     }
 }

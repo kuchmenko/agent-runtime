@@ -135,7 +135,8 @@ async fn main() {
             delay_ms: 200,
         })
         .tool(Save)
-        .build();
+        .build()
+        .unwrap();
 
     let started = Instant::now();
     let result = agent

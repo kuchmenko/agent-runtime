@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use super::openai_responses_proto::{self as proto, OpenAIEffort, OpenAISummary};
 use crate::error::ProviderError;
-use crate::provider::{LlmProvider, Request, Response};
+use crate::provider::{LlmProvider, Request, Response, ThinkingConfig, ThinkingEffort};
 use crate::stream::ProviderEventStream;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -25,6 +25,13 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 /// Chat Completions-compatible endpoints, use [`super::OpenAICompatible`]
 /// instead; that provider deliberately does not expose non-standard
 /// `reasoning_content` fields as thinking.
+///
+/// **Per-call thinking precedence:**
+/// [`crate::ThinkingConfig::Effort`] overrides the instance default
+/// (set via [`Self::with_reasoning`]). [`crate::ThinkingConfig::Disabled`]
+/// drops the entire reasoning block. [`crate::ThinkingConfig::Budget`]
+/// is **Anthropic-style and silently ignored** here — the instance
+/// default applies as if no per-call thinking were specified.
 pub struct OpenAIResponses {
     api_key: String,
     base_url: String,
@@ -99,7 +106,7 @@ impl LlmProvider for OpenAIResponses {
     async fn stream(&self, request: Request) -> Result<ProviderEventStream, ProviderError> {
         let mut body = build_request_body(
             &request,
-            self.reasoning.as_ref(),
+            effective_reasoning(&request, self.reasoning.as_ref()).as_ref(),
             self.include_encrypted_reasoning,
         );
         body["stream"] = json!(true);
@@ -129,7 +136,7 @@ impl LlmProvider for OpenAIResponses {
     async fn complete(&self, request: Request) -> Result<Response, ProviderError> {
         let body = build_request_body(
             &request,
-            self.reasoning.as_ref(),
+            effective_reasoning(&request, self.reasoning.as_ref()).as_ref(),
             self.include_encrypted_reasoning,
         );
 
@@ -194,6 +201,32 @@ fn build_request_body(
     body
 }
 
+fn effective_reasoning(
+    request: &Request,
+    instance: Option<&ReasoningConfig>,
+) -> Option<ReasoningConfig> {
+    match &request.thinking {
+        Some(ThinkingConfig::Disabled) => None,
+        Some(ThinkingConfig::Budget(_)) => instance.cloned(),
+        Some(ThinkingConfig::Effort(effort)) => Some(ReasoningConfig {
+            effort: map_thinking_effort(effort),
+            summary: instance
+                .map(|r| r.summary.clone())
+                .unwrap_or(OpenAISummary::Auto),
+        }),
+        None => instance.cloned(),
+    }
+}
+
+fn map_thinking_effort(effort: &ThinkingEffort) -> OpenAIEffort {
+    match effort {
+        ThinkingEffort::Low => OpenAIEffort::Low,
+        ThinkingEffort::Medium => OpenAIEffort::Medium,
+        ThinkingEffort::High => OpenAIEffort::High,
+        ThinkingEffort::Other(value) => OpenAIEffort::from(value.as_str()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +244,7 @@ mod tests {
             tools: vec![],
             max_tokens: 128,
             temperature: None,
+            thinking: None,
         };
         let reasoning = ReasoningConfig {
             effort: OpenAIEffort::Medium,
@@ -255,6 +289,7 @@ mod tests {
             tools: vec![],
             max_tokens: 128,
             temperature: None,
+            thinking: None,
         };
 
         let body = build_request_body(&req, None, true);
@@ -466,5 +501,118 @@ mod tests {
                 if id == "call_1|fc_1" && name == "bash" && input["command"] == "echo hi"
         ));
         assert!(out.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod thinking_override_tests {
+    //! Per-call `Request.thinking` precedence tests. Mirror of the
+    //! Anthropic provider's `thinking_override_tests`. Issue #40 Phase 2
+    //! acceptance criteria require explicit coverage on every provider
+    //! that supports thinking.
+    use super::*;
+    use crate::message::Message;
+    use crate::provider::{SystemBlock, ThinkingConfig, ThinkingEffort};
+
+    fn request(thinking: Option<ThinkingConfig>) -> Request {
+        Request {
+            model: "gpt-5".into(),
+            system: Some(vec![SystemBlock::text("be brief")]),
+            messages: vec![Message::user_text("hi")],
+            tools: vec![],
+            max_tokens: 64,
+            temperature: None,
+            thinking,
+        }
+    }
+
+    #[test]
+    fn effort_high_emits_wire_reasoning_effort_high() {
+        let req = request(Some(ThinkingConfig::Effort(ThinkingEffort::High)));
+        let body = build_request_body(&req, effective_reasoning(&req, None).as_ref(), false);
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn per_call_effort_overrides_instance_default() {
+        let instance = ReasoningConfig {
+            effort: OpenAIEffort::Low,
+            summary: OpenAISummary::Detailed,
+        };
+        let req = request(Some(ThinkingConfig::Effort(ThinkingEffort::High)));
+        let body = build_request_body(
+            &req,
+            effective_reasoning(&req, Some(&instance)).as_ref(),
+            false,
+        );
+        // Per-call hint wins over instance default.
+        assert_eq!(body["reasoning"]["effort"], "high");
+        // Instance summary preserved when not overridden.
+        assert_eq!(body["reasoning"]["summary"], "detailed");
+    }
+
+    #[test]
+    fn disabled_drops_reasoning_block_even_with_instance_default() {
+        let instance = ReasoningConfig {
+            effort: OpenAIEffort::High,
+            summary: OpenAISummary::Auto,
+        };
+        let req = request(Some(ThinkingConfig::Disabled));
+        let body = build_request_body(
+            &req,
+            effective_reasoning(&req, Some(&instance)).as_ref(),
+            false,
+        );
+        assert!(
+            body.get("reasoning").is_none(),
+            "Disabled must drop reasoning entirely; got {body:?}"
+        );
+    }
+
+    #[test]
+    fn budget_falls_back_to_instance_silently() {
+        // Budget is Anthropic-style; OpenAI providers ignore the value
+        // and apply their instance defaults (no per-call override). This
+        // test locks the documented contract; see ThinkingConfig::Budget
+        // doc and the per-provider docstring.
+        let instance = ReasoningConfig {
+            effort: OpenAIEffort::Medium,
+            summary: OpenAISummary::Auto,
+        };
+        let req = request(Some(ThinkingConfig::Budget(8192)));
+        let body = build_request_body(
+            &req,
+            effective_reasoning(&req, Some(&instance)).as_ref(),
+            false,
+        );
+        assert_eq!(body["reasoning"]["effort"], "medium");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
+    fn no_thinking_falls_through_to_instance() {
+        let instance = ReasoningConfig {
+            effort: OpenAIEffort::Low,
+            summary: OpenAISummary::Auto,
+        };
+        let req = request(None);
+        let body = build_request_body(
+            &req,
+            effective_reasoning(&req, Some(&instance)).as_ref(),
+            false,
+        );
+        assert_eq!(body["reasoning"]["effort"], "low");
+    }
+
+    #[test]
+    fn other_effort_passes_through_verbatim() {
+        let req = request(Some(ThinkingConfig::Effort(ThinkingEffort::Other(
+            "xhigh".into(),
+        ))));
+        let body = build_request_body(&req, effective_reasoning(&req, None).as_ref(), false);
+        // `xhigh` resolves to OpenAIEffort::from("xhigh") which on the
+        // wire emits "xhigh" verbatim (server-side validation handles
+        // unknown tiers).
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
     }
 }

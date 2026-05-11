@@ -151,7 +151,8 @@ async fn main() {
         // through the width-1 serial pool and wall time would be ≈ 3×
         // inner-delay instead of ≈ 1×.
         .tool_concurrency("agent", ToolConcurrency::on())
-        .build();
+        .build()
+        .unwrap();
 
     let started = Instant::now();
     let result = agent

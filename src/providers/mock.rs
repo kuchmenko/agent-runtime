@@ -30,6 +30,8 @@ type ResponseFn = dyn Fn(&Request) -> Result<Response, ProviderError> + Send + S
 pub struct Mock {
     handler: Arc<ResponseFn>,
     call_count: Arc<Mutex<usize>>,
+    complete_count: Arc<Mutex<usize>>,
+    stream_count: Arc<Mutex<usize>>,
 }
 
 impl Mock {
@@ -41,6 +43,8 @@ impl Mock {
         Self {
             handler: Arc::new(handler),
             call_count: Arc::new(Mutex::new(0)),
+            complete_count: Arc::new(Mutex::new(0)),
+            stream_count: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -76,9 +80,22 @@ impl Mock {
         })
     }
 
-    /// Returns how many times `complete()` was called.
+    /// Returns how many times `complete()` or `stream()` was called.
     pub fn call_count(&self) -> usize {
         *self.call_count.lock().unwrap()
+    }
+
+    /// Returns how many times `complete()` was called specifically.
+    pub fn complete_count(&self) -> usize {
+        *self.complete_count.lock().unwrap()
+    }
+
+    /// Returns how many times `stream()` was called specifically.
+    /// Used by tests that need to assert which API surface a consumer
+    /// took (e.g. SubAgent's trace_hook routing: stream when set, run
+    /// when unset).
+    pub fn stream_count(&self) -> usize {
+        *self.stream_count.lock().unwrap()
     }
 }
 
@@ -87,6 +104,10 @@ impl LlmProvider for Mock {
     async fn complete(&self, request: Request) -> Result<Response, ProviderError> {
         {
             let mut count = self.call_count.lock().unwrap();
+            *count += 1;
+        }
+        {
+            let mut count = self.complete_count.lock().unwrap();
             *count += 1;
         }
         (self.handler)(&request)
@@ -100,6 +121,10 @@ impl LlmProvider for Mock {
         let response = {
             let mut count = self.call_count.lock().unwrap();
             *count += 1;
+            {
+                let mut s = self.stream_count.lock().unwrap();
+                *s += 1;
+            }
             (self.handler)(&request)?
         };
 
@@ -156,6 +181,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             temperature: None,
+            thinking: None,
         }
     }
 

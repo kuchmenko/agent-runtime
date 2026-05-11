@@ -32,6 +32,7 @@ fn build_request() -> Request {
         }],
         max_tokens: 256,
         temperature: None,
+        thinking: None,
     }
 }
 
