@@ -47,7 +47,7 @@ impl Tool for SlowTool {
     }
 
     async fn execute(&self, _input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        self.started.notify_waiters();
+        self.started.notify_one();
         tokio::select! {
             _ = ctx.cancel.cancelled() => Err(ToolError::Cancelled),
             _ = tokio::time::sleep(self.delay) => Ok(ToolOutput::text("slow done")),
@@ -435,7 +435,7 @@ async fn operator_mode_change_emits_before_single_turn_stream_finishes() {
     handle
         .set_mode(Box::new(tkach::PlanMode), tkach::ModeAuthority::Operator)
         .unwrap();
-    release.notify_waiters();
+    release.notify_one();
 
     let mut saw_changed = false;
     while let Some(event) = stream.next().await {

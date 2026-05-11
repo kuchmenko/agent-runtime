@@ -114,10 +114,13 @@ impl AgentHandle {
         let mode: Arc<dyn AgentMode> = Arc::from(mode);
         match authority {
             ModeAuthority::Operator => {
-                let mut current = self.inner.mode.write().expect("agent mode lock poisoned");
-                let from = current.name().to_string();
-                let to = mode.name().to_string();
-                *current = mode;
+                let (from, to) = {
+                    let mut current = self.inner.mode.write().expect("agent mode lock poisoned");
+                    let from = current.name().to_string();
+                    let to = mode.name().to_string();
+                    *current = mode;
+                    (from, to)
+                };
                 *self
                     .inner
                     .pending_mode
