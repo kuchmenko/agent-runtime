@@ -655,12 +655,12 @@ async fn stream_text_response_emits_delta_then_collects_result() {
     }
     let result = stream.into_result().await.unwrap();
 
-    // Mock emits one ContentDelta per Text block; ToolUse/MessageDelta/
-    // Usage/Done are absorbed by the agent loop and not forwarded on
-    // the public stream channel. Done is documented as the terminal
-    // marker; consumers break on it and call into_result().
-    assert_eq!(events.len(), 1);
-    assert!(matches!(&events[0], StreamEvent::ContentDelta(t) if t == "Hello, world!"));
+    // The agent emits TurnStarted before provider deltas. Mock emits one
+    // ContentDelta per Text block; ToolUse/MessageDelta/Usage/Done are
+    // absorbed by the agent loop and not forwarded on the public stream.
+    assert_eq!(events.len(), 2);
+    assert!(matches!(&events[0], StreamEvent::TurnStarted { .. }));
+    assert!(matches!(&events[1], StreamEvent::ContentDelta(t) if t == "Hello, world!"));
 
     // Final history matches the run() shape: one assistant message with
     // text body assembled from deltas.
@@ -1168,6 +1168,11 @@ async fn subagent_trace_hook_receives_full_child_stream_events() {
         .tool(
             tkach::tools::SubAgent::new(child, "child").trace_hook(move |ev| {
                 let tag = match ev {
+                    StreamEvent::TurnStarted { .. } => "turn_started",
+                    StreamEvent::ModeChanged { .. } => "mode_changed",
+                    StreamEvent::ModeChangeRequested { .. } => "mode_change_requested",
+                    StreamEvent::ContinuationInjected { .. } => "continuation_injected",
+                    StreamEvent::GuardAborted { .. } => "guard_aborted",
                     StreamEvent::ContentDelta(_) => "content_delta",
                     StreamEvent::ThinkingDelta { .. } => "thinking_delta",
                     StreamEvent::ThinkingBlock { .. } => "thinking_block",
@@ -1276,6 +1281,11 @@ async fn subagent_trace_hook_observes_tool_call_path() {
                 .name("child")
                 .trace_hook(move |ev| {
                     let tag = match ev {
+                        StreamEvent::TurnStarted { .. } => "turn_started",
+                        StreamEvent::ModeChanged { .. } => "mode_changed",
+                        StreamEvent::ModeChangeRequested { .. } => "mode_change_requested",
+                        StreamEvent::ContinuationInjected { .. } => "continuation_injected",
+                        StreamEvent::GuardAborted { .. } => "guard_aborted",
                         StreamEvent::ContentDelta(_) => "content_delta",
                         StreamEvent::ThinkingDelta { .. } => "thinking_delta",
                         StreamEvent::ThinkingBlock { .. } => "thinking_block",

@@ -286,6 +286,9 @@ let mut stream = agent.stream(history, CancellationToken::new());
 
 while let Some(event) = stream.next().await {
     match event? {
+        StreamEvent::TurnStarted { turn_id } => {
+            eprintln!("[turn: {turn_id}]");          // correlate steering calls
+        }
         StreamEvent::ContentDelta(text) => {
             print!("{text}");                    // visible answer tokens
         }
@@ -315,11 +318,34 @@ while let Some(event) = stream.next().await {
 let result = stream.into_result().await?;        // final AgentResult
 ```
 
-`ThinkingDelta` and `ThinkingBlock` are public `StreamEvent` variants. Downstream exhaustive matches must add arms for them when upgrading.
+`TurnStarted`, `ThinkingDelta`, and `ThinkingBlock` are public `StreamEvent` variants. Downstream exhaustive matches must add arms for them when upgrading.
 
 Provider boundary: Anthropic thinking requires `Anthropic::with_adaptive_thinking*` or `with_thinking_budget(...)`; OpenAI thinking requires `OpenAIResponses` (`/responses` with `reasoning.summary`). `OpenAICompatible` is Chat Completions and intentionally asserts the no-thinking contract because that wire format has no standard reasoning-summary event.
 
 Backpressure is real: a slow consumer parks the producer task, which closes the SSE read side, which lets the OS shrink the TCP receive window — all the way back to the LLM server. Cancellation works mid-stream too: `cancel.cancel()` aborts the current SSE pull within milliseconds via `tokio::select!`.
+
+Steering-aware callers can use `run_with_handle` / `stream_with_handle` to get an `AgentHandle` for the active run:
+
+```rust
+let (mut stream, handle) = agent.stream_with_handle(history, CancellationToken::new());
+
+while let Some(event) = stream.next().await {
+    match event? {
+        StreamEvent::TurnStarted { turn_id } => {
+            handle.queue_user_message("Also include post-2023 sources", Some(turn_id))?;
+        }
+        StreamEvent::ToolCallPending { id, .. } if should_interrupt(&id) => {
+            handle.interrupt(InterruptTarget::Tool { tool_call_id: id })?;
+        }
+        StreamEvent::ContentDelta(text) => print!("{text}"),
+        _ => {}
+    }
+}
+
+let result = stream.into_result().await?;
+```
+
+Queued user messages are appended at the next provider-call boundary, never mid-tool. Tool interrupts cancel only that tool's child token; the agent feeds the cancellation result back to the model and continues the turn. The same handle also exposes mode gates (`PlanMode`, `AcceptEditsMode`, custom `AgentMode`), root-thread `ask_user(...)` via a caller-provided `UserInputBridge`, and synchronous `ContinuationGuard` predicates for keep-working loops.
 
 See [`examples/streaming_cancel.rs`](./examples/streaming_cancel.rs) for live cancel timing.
 

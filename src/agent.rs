@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -16,10 +17,13 @@ use crate::error::{AgentError, ProviderError};
 use crate::executor::{
     AllowAll, ConcurrencyConfig, ToolCall, ToolConcurrency, ToolExecutor, ToolPolicy, ToolRegistry,
 };
+use crate::guard::{AgentSnapshot, GuardEval, GuardTrigger};
 use crate::message::{CacheControl, Content, Message, StopReason, Usage};
 use crate::provider::{LlmProvider, Request, SystemBlock, ThinkingConfig, ToolDefinition};
+use crate::steering::{self, ActiveTurn, AgentControl, SteerCommand, TurnId};
 use crate::stream::StreamEvent;
 use crate::tool::{Tool, ToolContext};
+use crate::user_input::UserInputBridge;
 
 /// Fallback `stop_reason` for partial results returned before any turn
 /// has completed (e.g. provider failure on turn 0). Documented as
@@ -97,6 +101,7 @@ pub struct Agent {
     cache_tools: Option<CacheControl>,
     thinking: Option<ThinkingConfig>,
     tool_definition_filter: Option<HashSet<String>>,
+    user_input_bridge: Option<Arc<dyn UserInputBridge>>,
 }
 
 impl Agent {
@@ -175,6 +180,34 @@ impl Agent {
         messages: Vec<Message>,
         cancel: CancellationToken,
     ) -> Result<AgentResult, AgentError> {
+        let (future, _handle) = self.run_with_handle(messages, cancel);
+        future.await
+    }
+
+    pub fn run_with_handle(
+        &self,
+        messages: Vec<Message>,
+        cancel: CancellationToken,
+    ) -> (
+        impl Future<Output = Result<AgentResult, AgentError>> + Send + 'static,
+        crate::AgentHandle,
+    ) {
+        let agent = self.clone();
+        let (control, handle) = steering::control_pair(
+            cancel.clone(),
+            agent.depth == 0,
+            agent.user_input_bridge.clone(),
+        );
+        let future = async move { agent.run_loop(messages, cancel, control).await };
+        (future, handle)
+    }
+
+    async fn run_loop(
+        self,
+        messages: Vec<Message>,
+        cancel: CancellationToken,
+        mut control: AgentControl,
+    ) -> Result<AgentResult, AgentError> {
         let mut history = messages;
         let mut new_messages: Vec<Message> = Vec::new();
         let mut total_usage = Usage::default();
@@ -184,10 +217,12 @@ impl Agent {
         let mut last_stop: Option<StopReason> = None;
 
         let tool_defs = self.tool_definitions();
-        let ctx = self.make_context(cancel.clone());
 
         for turn in 0..self.max_turns {
-            info!(turn, "agent turn");
+            let (turn_id, turn_cancel, _mode_event) = begin_turn(&control, turn, &cancel);
+            let _turn_cleanup = ActiveTurnCleanup(Arc::clone(&control.handle_inner));
+            let ctx = self.make_context(turn_cancel);
+            info!(turn, %turn_id, "agent turn");
 
             if cancel.is_cancelled() {
                 return Err(AgentError::Cancelled {
@@ -197,7 +232,7 @@ impl Agent {
 
             let request = Request {
                 model: self.model.clone(),
-                system: self.system.clone(),
+                system: system_with_mode(&self.system, &control),
                 messages: history.clone(),
                 tools: tool_defs.clone(),
                 max_tokens: self.max_tokens,
@@ -205,7 +240,15 @@ impl Agent {
                 thinking: self.thinking.clone(),
             };
 
-            let response = match self.provider.complete(request).await {
+            let response = match tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => {
+                    return Err(AgentError::Cancelled {
+                        partial: build_partial(&new_messages, &total_usage, StopReason::Cancelled, ""),
+                    });
+                }
+                response = self.provider.complete(request) => response
+            } {
                 Ok(r) => r,
                 Err(source) => {
                     return Err(AgentError::Provider {
@@ -241,10 +284,27 @@ impl Agent {
                 .collect();
 
             if tool_calls.is_empty() || response.stop_reason == StopReason::EndTurn {
+                let before_drain = new_messages.len();
+                drain_queued_user_messages(&mut control, &turn_id, &mut history, &mut new_messages);
+                if new_messages.len() > before_drain {
+                    continue;
+                }
+                match inject_continuation_if_needed(
+                    &control,
+                    turn + 1,
+                    &[GuardTrigger::OnTurnEnd, GuardTrigger::OnSessionStop],
+                    &[],
+                    &mut history,
+                    &mut new_messages,
+                ) {
+                    InjectOutcome::Continue(_) => continue,
+                    InjectOutcome::Abort(_) | InjectOutcome::None => {}
+                }
                 let text = extract_text(&response.content);
                 info!(turn, "agent finished");
                 // Safe to unwrap: we just assigned `Some` above when this
                 // response was decoded.
+                clear_active_turn(&control);
                 return Ok(AgentResult {
                     new_messages,
                     text,
@@ -263,24 +323,54 @@ impl Agent {
                 });
             }
 
+            let recent_tool_calls = describe_tool_calls(&tool_calls);
             debug!(count = tool_calls.len(), "executing tool batch");
-            let results = self.executor.execute_batch(tool_calls, &ctx).await;
+            let results = self
+                .executor
+                .execute_batch_with_tracker(
+                    tool_calls,
+                    &ctx,
+                    Some(control.handle_inner.tool_runs.clone()),
+                    Some(current_mode(&control)),
+                )
+                .await;
 
             let user_msg = Message::user(results);
             history.push(user_msg.clone());
             new_messages.push(user_msg);
+            drain_queued_user_messages(&mut control, &turn_id, &mut history, &mut new_messages);
+            match inject_continuation_if_needed(
+                &control,
+                turn + 1,
+                &[GuardTrigger::OnTurnEnd],
+                &recent_tool_calls,
+                &mut history,
+                &mut new_messages,
+            ) {
+                InjectOutcome::Continue(_) => continue,
+                InjectOutcome::Abort(_) => {
+                    clear_active_turn(&control);
+                    return Ok(AgentResult {
+                        new_messages,
+                        text: String::new(),
+                        usage: total_usage,
+                        stop_reason: last_stop.unwrap_or(FALLBACK_STOP_REASON),
+                    });
+                }
+                InjectOutcome::None => {}
+            }
 
-            // If cancel fired while tools were running, skip the next
-            // provider round-trip — cooperative tools have already returned
-            // Cancelled error results, and another LLM call would only be
-            // wasted tokens before the pre-turn check stops us anyway.
-            if cancel.is_cancelled() {
+            // If turn/session cancel fired while tools were running, skip the
+            // next provider round-trip — cooperative tools have already
+            // returned Cancelled error results.
+            if ctx.cancel.is_cancelled() || cancel.is_cancelled() {
                 return Err(AgentError::Cancelled {
                     partial: build_partial(&new_messages, &total_usage, StopReason::Cancelled, ""),
                 });
             }
         }
 
+        clear_active_turn(&control);
         Err(AgentError::MaxTurnsReached {
             turns: self.max_turns,
             partial: build_partial(
@@ -318,6 +408,15 @@ impl Agent {
     /// shrink the TCP receive window, all the way back to the LLM
     /// server.
     pub fn stream(&self, messages: Vec<Message>, cancel: CancellationToken) -> AgentStream {
+        let (stream, _handle) = self.stream_with_handle(messages, cancel);
+        stream
+    }
+
+    pub fn stream_with_handle(
+        &self,
+        messages: Vec<Message>,
+        cancel: CancellationToken,
+    ) -> (AgentStream, crate::AgentHandle) {
         self.stream_internal(messages, cancel, None)
     }
 
@@ -335,7 +434,8 @@ impl Agent {
         cancel: CancellationToken,
         hook: TraceHook,
     ) -> AgentStream {
-        self.stream_internal(messages, cancel, Some(hook))
+        let (stream, _handle) = self.stream_internal(messages, cancel, Some(hook));
+        stream
     }
 
     fn stream_internal(
@@ -343,24 +443,32 @@ impl Agent {
         messages: Vec<Message>,
         cancel: CancellationToken,
         trace_hook: Option<TraceHook>,
-    ) -> AgentStream {
+    ) -> (AgentStream, crate::AgentHandle) {
         let agent = self.clone();
+        let (control, handle) = steering::control_pair(
+            cancel.clone(),
+            agent.depth == 0,
+            agent.user_input_bridge.clone(),
+        );
         let (events_tx, events_rx) = mpsc::channel::<Result<StreamEvent, ProviderError>>(16);
         let (result_tx, result_rx) = oneshot::channel();
 
         tokio::spawn(async move {
             let result = agent
-                .run_streaming_loop(messages, cancel, events_tx, trace_hook)
+                .run_streaming_loop(messages, cancel, control, events_tx, trace_hook)
                 .await;
             // If the consumer dropped before we finished, sending the
             // result is a no-op; that's fine.
             let _ = result_tx.send(result);
         });
 
-        AgentStream {
-            events_rx: ReceiverStream::new(events_rx),
-            result_rx: Some(result_rx),
-        }
+        (
+            AgentStream {
+                events_rx: ReceiverStream::new(events_rx),
+                result_rx: Some(result_rx),
+            },
+            handle,
+        )
     }
 
     /// Body of the streaming loop. Owns the task locally so the public
@@ -372,6 +480,7 @@ impl Agent {
         self,
         messages: Vec<Message>,
         cancel: CancellationToken,
+        mut control: AgentControl,
         events_tx: mpsc::Sender<Result<StreamEvent, ProviderError>>,
         trace_hook: Option<TraceHook>,
     ) -> Result<AgentResult, AgentError> {
@@ -381,10 +490,47 @@ impl Agent {
         let mut last_stop: Option<StopReason> = None;
 
         let tool_defs = self.tool_definitions();
-        let ctx = self.make_context(cancel.clone());
 
         for turn in 0..self.max_turns {
-            info!(turn, "agent stream turn");
+            let (turn_id, turn_cancel, mode_event) = begin_turn(&control, turn, &cancel);
+            let _turn_cleanup = ActiveTurnCleanup(Arc::clone(&control.handle_inner));
+            let ctx = self.make_context(turn_cancel);
+            info!(turn, %turn_id, "agent stream turn");
+            let turn_event = StreamEvent::TurnStarted {
+                turn_id: turn_id.clone(),
+            };
+            if let Some(hook) = &trace_hook {
+                emit_trace(hook, &turn_event);
+            }
+            if events_tx.send(Ok(turn_event)).await.is_err() {
+                return Err(AgentError::Cancelled {
+                    partial: build_partial(&new_messages, &total_usage, StopReason::Cancelled, ""),
+                });
+            }
+            emit_drained_mode_events(
+                &control,
+                &events_tx,
+                &trace_hook,
+                &new_messages,
+                &total_usage,
+                "",
+            )
+            .await?;
+            if let Some(event) = mode_event {
+                if let Some(hook) = &trace_hook {
+                    emit_trace(hook, &event);
+                }
+                if events_tx.send(Ok(event)).await.is_err() {
+                    return Err(AgentError::Cancelled {
+                        partial: build_partial(
+                            &new_messages,
+                            &total_usage,
+                            StopReason::Cancelled,
+                            "",
+                        ),
+                    });
+                }
+            }
 
             if cancel.is_cancelled() {
                 return Err(AgentError::Cancelled {
@@ -394,7 +540,7 @@ impl Agent {
 
             let request = Request {
                 model: self.model.clone(),
-                system: self.system.clone(),
+                system: system_with_mode(&self.system, &control),
                 messages: history.clone(),
                 tools: tool_defs.clone(),
                 max_tokens: self.max_tokens,
@@ -402,7 +548,15 @@ impl Agent {
                 thinking: self.thinking.clone(),
             };
 
-            let mut provider_stream = match self.provider.stream(request).await {
+            let mut provider_stream = match tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => {
+                    return Err(AgentError::Cancelled {
+                        partial: build_partial(&new_messages, &total_usage, StopReason::Cancelled, ""),
+                    });
+                }
+                stream = self.provider.stream(request) => stream
+            } {
                 Ok(s) => s,
                 Err(source) => {
                     return Err(AgentError::Provider {
@@ -440,7 +594,7 @@ impl Agent {
             loop {
                 let event = tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => {
+                    _ = ctx.cancel.cancelled() => {
                         return Err(AgentError::Cancelled {
                             partial: build_partial(
                                 &new_messages,
@@ -603,10 +757,15 @@ impl Agent {
                         }
                         break;
                     }
-                    // ToolCallPending is an agent-emitted event and
-                    // should never arrive from a provider's stream.
-                    // Ignore defensively if a buggy provider injects it.
-                    StreamEvent::ToolCallPending { .. } => {}
+                    // Agent-emitted events should never arrive from a
+                    // provider's stream. Ignore defensively if a buggy
+                    // provider injects one.
+                    StreamEvent::TurnStarted { .. }
+                    | StreamEvent::ModeChanged { .. }
+                    | StreamEvent::ModeChangeRequested { .. }
+                    | StreamEvent::ContinuationInjected { .. }
+                    | StreamEvent::GuardAborted { .. }
+                    | StreamEvent::ToolCallPending { .. } => {}
                 }
             }
             if !current_text_buf.is_empty() {
@@ -625,7 +784,63 @@ impl Agent {
             new_messages.push(assistant_msg);
 
             if tool_uses.is_empty() || resolved_stop == StopReason::EndTurn {
+                let before_drain = new_messages.len();
+                drain_queued_user_messages(&mut control, &turn_id, &mut history, &mut new_messages);
+                if new_messages.len() > before_drain {
+                    continue;
+                }
+                match inject_continuation_if_needed(
+                    &control,
+                    turn + 1,
+                    &[GuardTrigger::OnTurnEnd, GuardTrigger::OnSessionStop],
+                    &[],
+                    &mut history,
+                    &mut new_messages,
+                ) {
+                    InjectOutcome::Continue(event) => {
+                        if let Some(hook) = &trace_hook {
+                            emit_trace(hook, &event);
+                        }
+                        if events_tx.send(Ok(event)).await.is_err() {
+                            return Err(AgentError::Cancelled {
+                                partial: build_partial(
+                                    &new_messages,
+                                    &total_usage,
+                                    StopReason::Cancelled,
+                                    &turn_text,
+                                ),
+                            });
+                        }
+                        continue;
+                    }
+                    InjectOutcome::Abort(event) => {
+                        if let Some(hook) = &trace_hook {
+                            emit_trace(hook, &event);
+                        }
+                        if events_tx.send(Ok(event)).await.is_err() {
+                            return Err(AgentError::Cancelled {
+                                partial: build_partial(
+                                    &new_messages,
+                                    &total_usage,
+                                    StopReason::Cancelled,
+                                    &turn_text,
+                                ),
+                            });
+                        }
+                    }
+                    InjectOutcome::None => {}
+                }
+                emit_drained_mode_events(
+                    &control,
+                    &events_tx,
+                    &trace_hook,
+                    &new_messages,
+                    &total_usage,
+                    &turn_text,
+                )
+                .await?;
                 info!(turn, "agent stream finished");
+                clear_active_turn(&control);
                 return Ok(AgentResult {
                     new_messages,
                     text: turn_text,
@@ -645,6 +860,7 @@ impl Agent {
 
             debug!(count = tool_uses.len(), "executing tool batch (stream)");
             let calls = tool_uses;
+            let recent_tool_calls = describe_tool_calls(&calls);
 
             // Emit one `ToolCallPending` per call before invoking the
             // executor. The consumer's UI uses this to render an
@@ -681,18 +897,93 @@ impl Agent {
                 }
             }
 
-            let results = self.executor.execute_batch(calls, &ctx).await;
+            let results = self
+                .executor
+                .execute_batch_with_tracker(
+                    calls,
+                    &ctx,
+                    Some(control.handle_inner.tool_runs.clone()),
+                    Some(current_mode(&control)),
+                )
+                .await;
             let user_msg = Message::user(results);
             history.push(user_msg.clone());
             new_messages.push(user_msg);
+            drain_queued_user_messages(&mut control, &turn_id, &mut history, &mut new_messages);
+            match inject_continuation_if_needed(
+                &control,
+                turn + 1,
+                &[GuardTrigger::OnTurnEnd],
+                &recent_tool_calls,
+                &mut history,
+                &mut new_messages,
+            ) {
+                InjectOutcome::Continue(event) => {
+                    if let Some(hook) = &trace_hook {
+                        emit_trace(hook, &event);
+                    }
+                    if events_tx.send(Ok(event)).await.is_err() {
+                        return Err(AgentError::Cancelled {
+                            partial: build_partial(
+                                &new_messages,
+                                &total_usage,
+                                StopReason::Cancelled,
+                                "",
+                            ),
+                        });
+                    }
+                }
+                InjectOutcome::Abort(event) => {
+                    if let Some(hook) = &trace_hook {
+                        emit_trace(hook, &event);
+                    }
+                    if events_tx.send(Ok(event)).await.is_err() {
+                        return Err(AgentError::Cancelled {
+                            partial: build_partial(
+                                &new_messages,
+                                &total_usage,
+                                StopReason::Cancelled,
+                                "",
+                            ),
+                        });
+                    }
+                    emit_drained_mode_events(
+                        &control,
+                        &events_tx,
+                        &trace_hook,
+                        &new_messages,
+                        &total_usage,
+                        "",
+                    )
+                    .await?;
+                    clear_active_turn(&control);
+                    return Ok(AgentResult {
+                        new_messages,
+                        text: turn_text,
+                        usage: total_usage,
+                        stop_reason: last_stop.unwrap_or(FALLBACK_STOP_REASON),
+                    });
+                }
+                InjectOutcome::None => {}
+            }
 
-            if cancel.is_cancelled() {
+            if ctx.cancel.is_cancelled() || cancel.is_cancelled() {
                 return Err(AgentError::Cancelled {
                     partial: build_partial(&new_messages, &total_usage, StopReason::Cancelled, ""),
                 });
             }
         }
 
+        emit_drained_mode_events(
+            &control,
+            &events_tx,
+            &trace_hook,
+            &new_messages,
+            &total_usage,
+            "",
+        )
+        .await?;
+        clear_active_turn(&control);
         warn!(turns = self.max_turns, "agent stream max turns");
         Err(AgentError::MaxTurnsReached {
             turns: self.max_turns,
@@ -703,6 +994,230 @@ impl Agent {
                 "",
             ),
         })
+    }
+}
+
+fn begin_turn(
+    control: &AgentControl,
+    turn: usize,
+    cancel: &CancellationToken,
+) -> (TurnId, CancellationToken, Option<StreamEvent>) {
+    let turn_id = TurnId::new();
+    let turn_cancel = cancel.child_token();
+    *control
+        .handle_inner
+        .active_turn
+        .write()
+        .expect("agent handle turn lock poisoned") = Some(ActiveTurn {
+        id: turn_id.clone(),
+        cancel: turn_cancel.clone(),
+        accepting_steer: true,
+    });
+    let mode_event = apply_pending_mode(control, &turn_id);
+    debug!(turn, %turn_id, "active turn set");
+    (turn_id, turn_cancel, mode_event)
+}
+
+fn system_with_mode(
+    base: &Option<Vec<SystemBlock>>,
+    control: &AgentControl,
+) -> Option<Vec<SystemBlock>> {
+    let addendum = current_mode(control).system_prompt_addendum();
+    if addendum.is_empty() {
+        return base.clone();
+    }
+    let mut system = base.clone().unwrap_or_default();
+    system.push(SystemBlock::text(addendum.into_owned()));
+    Some(system)
+}
+
+fn current_mode(control: &AgentControl) -> Arc<dyn crate::mode::AgentMode> {
+    Arc::clone(
+        &control
+            .handle_inner
+            .mode
+            .read()
+            .expect("agent mode lock poisoned"),
+    )
+}
+
+async fn emit_drained_mode_events(
+    control: &AgentControl,
+    events_tx: &mpsc::Sender<Result<StreamEvent, ProviderError>>,
+    trace_hook: &Option<TraceHook>,
+    new_messages: &[Message],
+    total_usage: &Usage,
+    partial_text: &str,
+) -> Result<(), AgentError> {
+    for event in drain_mode_events(control) {
+        if let Some(hook) = trace_hook {
+            emit_trace(hook, &event);
+        }
+        if events_tx.send(Ok(event)).await.is_err() {
+            return Err(AgentError::Cancelled {
+                partial: build_partial(
+                    new_messages,
+                    total_usage,
+                    StopReason::Cancelled,
+                    partial_text,
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn drain_mode_events(control: &AgentControl) -> Vec<StreamEvent> {
+    control
+        .handle_inner
+        .mode_events
+        .lock()
+        .expect("mode event lock poisoned")
+        .drain(..)
+        .collect()
+}
+
+fn apply_pending_mode(control: &AgentControl, turn_id: &TurnId) -> Option<StreamEvent> {
+    let mut pending = control
+        .handle_inner
+        .pending_mode
+        .write()
+        .expect("pending mode lock poisoned");
+    let pending_change = pending.as_mut()?;
+    if !pending_change.announced {
+        pending_change.announced = true;
+        return Some(StreamEvent::ModeChangeRequested {
+            from: pending_change.from.clone(),
+            to: pending_change.to.clone(),
+            requested_at: turn_id.clone(),
+        });
+    }
+
+    let pending_change = pending.take()?;
+    let mut mode = control
+        .handle_inner
+        .mode
+        .write()
+        .expect("agent mode lock poisoned");
+    *mode = pending_change.mode;
+    Some(StreamEvent::ModeChanged {
+        from: pending_change.from,
+        to: pending_change.to,
+        authority: pending_change.authority,
+    })
+}
+
+struct ActiveTurnCleanup(Arc<steering::AgentHandleInner>);
+
+impl Drop for ActiveTurnCleanup {
+    fn drop(&mut self) {
+        clear_active_turn_inner(&self.0);
+    }
+}
+
+fn clear_active_turn(control: &AgentControl) {
+    clear_active_turn_inner(&control.handle_inner);
+}
+
+fn clear_active_turn_inner(inner: &steering::AgentHandleInner) {
+    *inner
+        .active_turn
+        .write()
+        .expect("agent handle turn lock poisoned") = None;
+}
+
+enum InjectOutcome {
+    Continue(StreamEvent),
+    Abort(StreamEvent),
+    None,
+}
+
+fn describe_tool_calls(calls: &[ToolCall]) -> Vec<String> {
+    calls
+        .iter()
+        .map(|call| format!("{}:{}", call.name, call.id))
+        .collect()
+}
+
+fn inject_continuation_if_needed(
+    control: &AgentControl,
+    turn_count: usize,
+    triggers: &[GuardTrigger],
+    recent_tool_calls: &[String],
+    history: &mut Vec<Message>,
+    new_messages: &mut Vec<Message>,
+) -> InjectOutcome {
+    let snapshot = AgentSnapshot {
+        turn_count,
+        last_assistant_message: new_messages
+            .iter()
+            .rev()
+            .find(|message| message.role == crate::message::Role::Assistant)
+            .cloned(),
+        recent_tool_calls: recent_tool_calls.to_vec(),
+    };
+    let mut guards = control
+        .handle_inner
+        .guards
+        .write()
+        .expect("continuation guard lock poisoned");
+    for trigger in triggers {
+        match guards.evaluate(*trigger, &snapshot) {
+            GuardEval::Continue {
+                guard_name,
+                prompt,
+                iteration,
+            } => {
+                let message = Message::user_text(prompt);
+                history.push(message.clone());
+                new_messages.push(message);
+                return InjectOutcome::Continue(StreamEvent::ContinuationInjected {
+                    guard_name,
+                    iteration,
+                });
+            }
+            GuardEval::Abort { guard_name, reason } => {
+                return InjectOutcome::Abort(StreamEvent::GuardAborted { guard_name, reason });
+            }
+            GuardEval::Stop => {}
+        }
+    }
+    InjectOutcome::None
+}
+
+fn drain_queued_user_messages(
+    control: &mut AgentControl,
+    turn_id: &TurnId,
+    history: &mut Vec<Message>,
+    new_messages: &mut Vec<Message>,
+) {
+    if let Some(active) = control
+        .handle_inner
+        .active_turn
+        .write()
+        .expect("agent handle turn lock poisoned")
+        .as_mut()
+    {
+        active.accepting_steer = false;
+    }
+
+    let mut content = Vec::new();
+    while let Ok(command) = control.steer_rx.try_recv() {
+        match command {
+            SteerCommand::Append {
+                turn_id: command_turn_id,
+                content: mut queued,
+            } if command_turn_id == *turn_id => content.append(&mut queued),
+            SteerCommand::Append { .. } => tracing::warn!(
+                %turn_id,
+                "discarding stale queued steering message for inactive turn"
+            ),
+        }
+    }
+    if !content.is_empty() {
+        let message = Message::user(content);
+        history.push(message.clone());
+        new_messages.push(message);
     }
 }
 
@@ -833,6 +1348,7 @@ pub struct AgentBuilder {
     tool_concurrencies: Vec<(String, ToolConcurrency)>,
     thinking: Option<ThinkingConfig>,
     tool_definition_filter: Option<HashSet<String>>,
+    user_input_bridge: Option<Arc<dyn UserInputBridge>>,
 }
 
 impl AgentBuilder {
@@ -857,6 +1373,7 @@ impl AgentBuilder {
             tool_concurrencies: Vec::new(),
             thinking: None,
             tool_definition_filter: None,
+            user_input_bridge: None,
         }
     }
 
@@ -942,6 +1459,11 @@ impl AgentBuilder {
     /// agent tree.
     pub fn approval(mut self, approval: impl ApprovalHandler + 'static) -> Self {
         self.approval = Some(Arc::new(approval));
+        self
+    }
+
+    pub fn user_input_bridge(mut self, bridge: impl UserInputBridge + 'static) -> Self {
+        self.user_input_bridge = Some(Arc::new(bridge));
         self
     }
 
@@ -1151,6 +1673,7 @@ impl AgentBuilder {
             cache_tools: self.cache_tools,
             thinking: self.thinking,
             tool_definition_filter: self.tool_definition_filter,
+            user_input_bridge: self.user_input_bridge,
         })
     }
 

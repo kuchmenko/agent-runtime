@@ -19,6 +19,8 @@ use serde_json::Value;
 
 use crate::error::ProviderError;
 use crate::message::{StopReason, ThinkingMetadata, ThinkingProvider, Usage};
+use crate::mode::ModeAuthority;
+use crate::steering::TurnId;
 use crate::tool::ToolClass;
 
 /// One unit of progress from a streaming provider.
@@ -31,6 +33,30 @@ use crate::tool::ToolClass;
 /// arrives once at the end. `Done` is the terminal marker.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
+    /// Agent-level event fired when a new turn starts.
+    TurnStarted { turn_id: TurnId },
+
+    /// Agent-level event fired when an operator-applied mode changes immediately
+    /// or an agent-requested mode is applied at a turn edge.
+    ModeChanged {
+        from: String,
+        to: String,
+        authority: ModeAuthority,
+    },
+
+    /// Agent-level event fired when an agent-authority mode change is queued.
+    ModeChangeRequested {
+        from: String,
+        to: String,
+        requested_at: TurnId,
+    },
+
+    /// Agent-level event fired when a continuation guard injects a prompt.
+    ContinuationInjected { guard_name: String, iteration: u32 },
+
+    /// Agent-level event fired when a continuation guard aborts or panics.
+    GuardAborted { guard_name: String, reason: String },
+
     /// A piece of assistant text. Concatenate in order to reconstruct
     /// the full reply.
     ContentDelta(String),

@@ -30,6 +30,18 @@ pub struct ToolContext {
     pub executor: Arc<ToolExecutor>,
 }
 
+impl ToolContext {
+    pub(crate) fn with_cancel(&self, cancel: CancellationToken) -> Self {
+        Self {
+            working_dir: self.working_dir.clone(),
+            cancel,
+            depth: self.depth,
+            max_depth: self.max_depth,
+            executor: Arc::clone(&self.executor),
+        }
+    }
+}
+
 /// Result of a tool execution.
 pub enum ToolOutput {
     Text(String),
