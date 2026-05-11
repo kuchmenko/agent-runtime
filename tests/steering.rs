@@ -6,8 +6,9 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tkach::message::{Content, Message, StopReason, Usage};
-use tkach::provider::Response;
+use tkach::provider::{LlmProvider, Request, Response};
 use tkach::providers::Mock;
+use tkach::stream::ProviderEventStream;
 use tkach::{
     Agent, CancellationToken, InterruptOutcome, InterruptTarget, StreamEvent, Tool, ToolClass,
     ToolContext, ToolError, ToolOutput, TurnId,
@@ -386,6 +387,72 @@ impl tkach::UserInputBridge for TestBridge {
     ) -> Result<tkach::UserInputResponse, tkach::BridgeError> {
         Ok(tkach::UserInputResponse::Cancelled)
     }
+}
+
+struct GatedStreamProvider {
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl LlmProvider for GatedStreamProvider {
+    async fn complete(&self, _request: Request) -> Result<Response, tkach::ProviderError> {
+        Ok(Response {
+            content: vec![Content::text("hello")],
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        })
+    }
+
+    async fn stream(&self, _request: Request) -> Result<ProviderEventStream, tkach::ProviderError> {
+        self.release.notified().await;
+        Ok(Box::pin(futures::stream::iter([
+            Ok(StreamEvent::ContentDelta("hello".into())),
+            Ok(StreamEvent::MessageDelta {
+                stop_reason: StopReason::EndTurn,
+            }),
+            Ok(StreamEvent::Usage(Usage::default())),
+            Ok(StreamEvent::Done),
+        ])))
+    }
+}
+
+#[tokio::test]
+async fn operator_mode_change_emits_before_single_turn_stream_finishes() {
+    let release = Arc::new(Notify::new());
+    let agent = Agent::builder()
+        .provider(GatedStreamProvider {
+            release: Arc::clone(&release),
+        })
+        .model("test")
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let (mut stream, handle) = agent.stream_with_handle(prompt("hi"), CancellationToken::new());
+    let first = stream.next().await.unwrap().unwrap();
+    assert!(matches!(first, StreamEvent::TurnStarted { .. }));
+
+    handle
+        .set_mode(Box::new(tkach::PlanMode), tkach::ModeAuthority::Operator)
+        .unwrap();
+    release.notify_waiters();
+
+    let mut saw_changed = false;
+    while let Some(event) = stream.next().await {
+        if let StreamEvent::ModeChanged {
+            from,
+            to,
+            authority,
+        } = event.unwrap()
+        {
+            saw_changed = from == "default" && to == "plan";
+            assert_eq!(authority, tkach::ModeAuthority::Operator);
+        }
+    }
+
+    assert!(saw_changed, "operator mode change was not emitted");
+    let result = stream.into_result().await.unwrap();
+    assert_eq!(result.text, "hello");
 }
 
 #[tokio::test]

@@ -507,21 +507,15 @@ impl Agent {
                     partial: build_partial(&new_messages, &total_usage, StopReason::Cancelled, ""),
                 });
             }
-            for event in drain_mode_events(&control) {
-                if let Some(hook) = &trace_hook {
-                    emit_trace(hook, &event);
-                }
-                if events_tx.send(Ok(event)).await.is_err() {
-                    return Err(AgentError::Cancelled {
-                        partial: build_partial(
-                            &new_messages,
-                            &total_usage,
-                            StopReason::Cancelled,
-                            "",
-                        ),
-                    });
-                }
-            }
+            emit_drained_mode_events(
+                &control,
+                &events_tx,
+                &trace_hook,
+                &new_messages,
+                &total_usage,
+                "",
+            )
+            .await?;
             if let Some(event) = mode_event {
                 if let Some(hook) = &trace_hook {
                     emit_trace(hook, &event);
@@ -836,6 +830,15 @@ impl Agent {
                     }
                     InjectOutcome::None => {}
                 }
+                emit_drained_mode_events(
+                    &control,
+                    &events_tx,
+                    &trace_hook,
+                    &new_messages,
+                    &total_usage,
+                    &turn_text,
+                )
+                .await?;
                 info!(turn, "agent stream finished");
                 clear_active_turn(&control);
                 return Ok(AgentResult {
@@ -944,6 +947,15 @@ impl Agent {
                             ),
                         });
                     }
+                    emit_drained_mode_events(
+                        &control,
+                        &events_tx,
+                        &trace_hook,
+                        &new_messages,
+                        &total_usage,
+                        "",
+                    )
+                    .await?;
                     clear_active_turn(&control);
                     return Ok(AgentResult {
                         new_messages,
@@ -962,6 +974,15 @@ impl Agent {
             }
         }
 
+        emit_drained_mode_events(
+            &control,
+            &events_tx,
+            &trace_hook,
+            &new_messages,
+            &total_usage,
+            "",
+        )
+        .await?;
         clear_active_turn(&control);
         warn!(turns = self.max_turns, "agent stream max turns");
         Err(AgentError::MaxTurnsReached {
@@ -1018,6 +1039,32 @@ fn current_mode(control: &AgentControl) -> Arc<dyn crate::mode::AgentMode> {
             .read()
             .expect("agent mode lock poisoned"),
     )
+}
+
+async fn emit_drained_mode_events(
+    control: &AgentControl,
+    events_tx: &mpsc::Sender<Result<StreamEvent, ProviderError>>,
+    trace_hook: &Option<TraceHook>,
+    new_messages: &[Message],
+    total_usage: &Usage,
+    partial_text: &str,
+) -> Result<(), AgentError> {
+    for event in drain_mode_events(control) {
+        if let Some(hook) = trace_hook {
+            emit_trace(hook, &event);
+        }
+        if events_tx.send(Ok(event)).await.is_err() {
+            return Err(AgentError::Cancelled {
+                partial: build_partial(
+                    new_messages,
+                    total_usage,
+                    StopReason::Cancelled,
+                    partial_text,
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn drain_mode_events(control: &AgentControl) -> Vec<StreamEvent> {
