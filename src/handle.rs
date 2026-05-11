@@ -10,6 +10,7 @@ use crate::steering::{
     AgentHandleInner, InterruptError, InterruptOutcome, InterruptTarget, IntoQueueContent,
     PendingModeChange, SteerCommand, SteerError, TurnId,
 };
+use crate::stream::StreamEvent;
 use crate::user_input::{self, AskUserError, QuestionSet, UserInputResponse};
 
 /// Cheap cloneable control handle for a running agent.
@@ -28,6 +29,12 @@ impl AgentHandle {
         let content = content.into_queue_content();
         if content.is_empty() {
             return Err(SteerError::EmptyContent);
+        }
+        if content
+            .iter()
+            .any(|content| !matches!(content, crate::Content::Text { .. }))
+        {
+            return Err(SteerError::InvalidContent);
         }
 
         let active = self
@@ -107,20 +114,45 @@ impl AgentHandle {
         let mode: Arc<dyn AgentMode> = Arc::from(mode);
         match authority {
             ModeAuthority::Operator => {
-                *self.inner.mode.write().expect("agent mode lock poisoned") = mode;
+                let mut current = self.inner.mode.write().expect("agent mode lock poisoned");
+                let from = current.name().to_string();
+                let to = mode.name().to_string();
+                *current = mode;
                 *self
                     .inner
                     .pending_mode
                     .write()
                     .expect("pending mode lock poisoned") = None;
+                self.inner
+                    .mode_events
+                    .lock()
+                    .expect("mode event lock poisoned")
+                    .push_back(StreamEvent::ModeChanged {
+                        from,
+                        to,
+                        authority,
+                    });
             }
             ModeAuthority::Agent => {
+                let from = self
+                    .inner
+                    .mode
+                    .read()
+                    .expect("agent mode lock poisoned")
+                    .name()
+                    .to_string();
+                let to = mode.name().to_string();
                 *self
                     .inner
                     .pending_mode
                     .write()
-                    .expect("pending mode lock poisoned") =
-                    Some(PendingModeChange { mode, authority });
+                    .expect("pending mode lock poisoned") = Some(PendingModeChange {
+                    mode,
+                    authority,
+                    from,
+                    to,
+                    announced: false,
+                });
             }
         }
         Ok(())

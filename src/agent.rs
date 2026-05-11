@@ -348,7 +348,16 @@ impl Agent {
                 &mut new_messages,
             ) {
                 InjectOutcome::Continue(_) => continue,
-                InjectOutcome::Abort(_) | InjectOutcome::None => {}
+                InjectOutcome::Abort(_) => {
+                    clear_active_turn(&control);
+                    return Ok(AgentResult {
+                        new_messages,
+                        text: String::new(),
+                        usage: total_usage,
+                        stop_reason: last_stop.unwrap_or(FALLBACK_STOP_REASON),
+                    });
+                }
+                InjectOutcome::None => {}
             }
 
             // If turn/session cancel fired while tools were running, skip the
@@ -497,6 +506,21 @@ impl Agent {
                 return Err(AgentError::Cancelled {
                     partial: build_partial(&new_messages, &total_usage, StopReason::Cancelled, ""),
                 });
+            }
+            for event in drain_mode_events(&control) {
+                if let Some(hook) = &trace_hook {
+                    emit_trace(hook, &event);
+                }
+                if events_tx.send(Ok(event)).await.is_err() {
+                    return Err(AgentError::Cancelled {
+                        partial: build_partial(
+                            &new_messages,
+                            &total_usage,
+                            StopReason::Cancelled,
+                            "",
+                        ),
+                    });
+                }
             }
             if let Some(event) = mode_event {
                 if let Some(hook) = &trace_hook {
@@ -891,7 +915,7 @@ impl Agent {
                 &mut history,
                 &mut new_messages,
             ) {
-                InjectOutcome::Continue(event) | InjectOutcome::Abort(event) => {
+                InjectOutcome::Continue(event) => {
                     if let Some(hook) = &trace_hook {
                         emit_trace(hook, &event);
                     }
@@ -905,6 +929,28 @@ impl Agent {
                             ),
                         });
                     }
+                }
+                InjectOutcome::Abort(event) => {
+                    if let Some(hook) = &trace_hook {
+                        emit_trace(hook, &event);
+                    }
+                    if events_tx.send(Ok(event)).await.is_err() {
+                        return Err(AgentError::Cancelled {
+                            partial: build_partial(
+                                &new_messages,
+                                &total_usage,
+                                StopReason::Cancelled,
+                                "",
+                            ),
+                        });
+                    }
+                    clear_active_turn(&control);
+                    return Ok(AgentResult {
+                        new_messages,
+                        text: turn_text,
+                        usage: total_usage,
+                        stop_reason: last_stop.unwrap_or(FALLBACK_STOP_REASON),
+                    });
                 }
                 InjectOutcome::None => {}
             }
@@ -946,7 +992,7 @@ fn begin_turn(
         cancel: turn_cancel.clone(),
         accepting_steer: true,
     });
-    let mode_event = apply_pending_mode(control);
+    let mode_event = apply_pending_mode(control, &turn_id);
     debug!(turn, %turn_id, "active turn set");
     (turn_id, turn_cancel, mode_event)
 }
@@ -974,25 +1020,43 @@ fn current_mode(control: &AgentControl) -> Arc<dyn crate::mode::AgentMode> {
     )
 }
 
-fn apply_pending_mode(control: &AgentControl) -> Option<StreamEvent> {
-    let pending = control
+fn drain_mode_events(control: &AgentControl) -> Vec<StreamEvent> {
+    control
+        .handle_inner
+        .mode_events
+        .lock()
+        .expect("mode event lock poisoned")
+        .drain(..)
+        .collect()
+}
+
+fn apply_pending_mode(control: &AgentControl, turn_id: &TurnId) -> Option<StreamEvent> {
+    let mut pending = control
         .handle_inner
         .pending_mode
         .write()
-        .expect("pending mode lock poisoned")
-        .take()?;
+        .expect("pending mode lock poisoned");
+    let pending_change = pending.as_mut()?;
+    if !pending_change.announced {
+        pending_change.announced = true;
+        return Some(StreamEvent::ModeChangeRequested {
+            from: pending_change.from.clone(),
+            to: pending_change.to.clone(),
+            requested_at: turn_id.clone(),
+        });
+    }
+
+    let pending_change = pending.take()?;
     let mut mode = control
         .handle_inner
         .mode
         .write()
         .expect("agent mode lock poisoned");
-    let from = mode.name().to_string();
-    let to = pending.mode.name().to_string();
-    *mode = pending.mode;
+    *mode = pending_change.mode;
     Some(StreamEvent::ModeChanged {
-        from,
-        to,
-        authority: pending.authority,
+        from: pending_change.from,
+        to: pending_change.to,
+        authority: pending_change.authority,
     })
 }
 

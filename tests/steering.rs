@@ -121,6 +121,54 @@ async fn queued_user_message_drains_before_next_provider_request() {
 }
 
 #[tokio::test]
+async fn queue_rejects_non_user_content() {
+    let started = Arc::new(Notify::new());
+    let mock = Mock::new(|_| {
+        Ok(Response {
+            content: vec![Content::ToolUse {
+                id: "slow-1".into(),
+                name: "slow".into(),
+                input: json!({}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+        })
+    });
+
+    let agent = Agent::builder()
+        .provider(mock)
+        .model("test")
+        .tool(SlowTool {
+            started: Arc::clone(&started),
+            delay: Duration::from_millis(200),
+        })
+        .max_turns(1)
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let cancel = CancellationToken::new();
+    let (future, handle) = agent.run_with_handle(prompt("start"), cancel.clone());
+    let task = tokio::spawn(future);
+
+    started.notified().await;
+    let err = handle
+        .queue_user_message(
+            vec![Content::ToolResult {
+                tool_use_id: "t1".into(),
+                content: "not user content".into(),
+                is_error: false,
+                cache_control: None,
+            }],
+            handle.current_turn_id(),
+        )
+        .unwrap_err();
+    assert!(matches!(err, tkach::SteerError::InvalidContent));
+    cancel.cancel();
+    let _ = task.await;
+}
+
+#[tokio::test]
 async fn queue_rejects_mismatched_turn_id() {
     let started = Arc::new(Notify::new());
     let mock = Mock::new(|_| {
@@ -341,6 +389,71 @@ impl tkach::UserInputBridge for TestBridge {
 }
 
 #[tokio::test]
+async fn agent_mode_request_event_can_be_cancelled_before_apply() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = Arc::clone(&calls);
+    let mock = Mock::new(move |_| {
+        let n = calls_clone.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "slow-1".into(),
+                    name: "slow".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+        } else {
+            Ok(Response {
+                content: vec![Content::text("done")],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    });
+    let agent = Agent::builder()
+        .provider(mock)
+        .model("test")
+        .tool(SlowTool {
+            started: Arc::new(Notify::new()),
+            delay: Duration::from_millis(25),
+        })
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let (mut stream, handle) = agent.stream_with_handle(prompt("start"), CancellationToken::new());
+    while let Some(event) = stream.next().await {
+        if matches!(event.unwrap(), StreamEvent::ToolCallPending { .. }) {
+            break;
+        }
+    }
+    handle
+        .set_mode(Box::new(tkach::PlanMode), tkach::ModeAuthority::Agent)
+        .unwrap();
+
+    let mut saw_requested = false;
+    let mut saw_changed = false;
+    while let Some(event) = stream.next().await {
+        match event.unwrap() {
+            StreamEvent::ModeChangeRequested { from, to, .. } => {
+                saw_requested = from == "default" && to == "plan";
+                handle.cancel_pending_mode_change().unwrap();
+            }
+            StreamEvent::ModeChanged { .. } => saw_changed = true,
+            StreamEvent::ContentDelta(_) => break,
+            _ => {}
+        }
+    }
+
+    assert!(saw_requested, "agent mode request was not emitted");
+    assert!(!saw_changed, "cancelled pending mode still applied");
+    let result = stream.into_result().await.unwrap();
+    assert_eq!(result.text, "done");
+}
+
+#[tokio::test]
 async fn root_handle_can_ask_user_via_bridge() {
     let agent = Agent::builder()
         .provider(Mock::with_text("hello"))
@@ -360,6 +473,78 @@ async fn root_handle_can_ask_user_via_bridge() {
         .await
         .unwrap();
     assert_eq!(response, tkach::UserInputResponse::Cancelled);
+}
+
+#[tokio::test]
+async fn continuation_guard_rejects_unwired_operator_command_escape() {
+    let agent = Agent::builder()
+        .provider(Mock::with_text("hello"))
+        .model("test")
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+    let (_future, handle) = agent.run_with_handle(prompt("hi"), CancellationToken::new());
+
+    let err = handle
+        .install_continuation_guard(tkach::ContinuationGuard {
+            name: "unbounded".into(),
+            trigger: tkach::GuardTrigger::OnTurnEnd,
+            predicate: Box::new(|_| tkach::GuardDecision::Continue),
+            continuation_prompt: "continue".into(),
+            max_iterations: None,
+            escape: tkach::GuardEscape::OperatorCommand("stop".into()),
+        })
+        .unwrap_err();
+    assert!(matches!(err, tkach::GuardError::NoEscapeMechanism));
+}
+
+#[tokio::test]
+async fn continuation_guard_abort_after_tool_result_stops_run() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = Arc::clone(&calls);
+    let mock = Mock::new(move |_| {
+        let n = calls_clone.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "m1".into(),
+                    name: "mutate".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+        } else {
+            panic!("guard abort should stop before the next provider turn");
+        }
+    });
+    let agent = Agent::builder()
+        .provider(mock)
+        .model("test")
+        .tool(MutatingProbe)
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+    let (future, handle) = agent.run_with_handle(prompt("start"), CancellationToken::new());
+    handle
+        .install_continuation_guard(tkach::ContinuationGuard {
+            name: "abort".into(),
+            trigger: tkach::GuardTrigger::OnTurnEnd,
+            predicate: Box::new(|snapshot| {
+                assert_eq!(snapshot.recent_tool_calls, vec!["mutate:m1".to_string()]);
+                tkach::GuardDecision::Abort {
+                    reason: "stop now".into(),
+                }
+            }),
+            continuation_prompt: "unused".into(),
+            max_iterations: Some(1),
+            escape: tkach::GuardEscape::MaxIterations,
+        })
+        .unwrap();
+
+    let result = future.await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(result.stop_reason, StopReason::ToolUse);
 }
 
 #[tokio::test]

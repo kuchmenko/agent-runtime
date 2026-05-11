@@ -46,7 +46,7 @@ pub struct AgentSnapshot {
 
 #[derive(Debug, thiserror::Error)]
 pub enum GuardError {
-    #[error("guard must have an escape mechanism: max_iterations or operator command")]
+    #[error("guard must have max_iterations")]
     NoEscapeMechanism,
     #[error("guard not found")]
     NotFound,
@@ -79,9 +79,7 @@ pub(crate) enum GuardEval {
 
 impl GuardSet {
     pub(crate) fn install(&mut self, guard: ContinuationGuard) -> Result<GuardId, GuardError> {
-        if guard.max_iterations.is_none()
-            && !matches!(guard.escape, GuardEscape::OperatorCommand(_))
-        {
+        if guard.max_iterations.is_none() {
             return Err(GuardError::NoEscapeMechanism);
         }
         let id = GuardId(self.next_id);

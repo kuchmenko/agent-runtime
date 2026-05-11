@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::guard::GuardSet;
 use crate::message::Content;
 use crate::mode::{AgentMode, DefaultMode, ModeAuthority};
+use crate::stream::StreamEvent;
 use crate::user_input::UserInputBridge;
 
 static TURN_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -86,9 +87,7 @@ impl IntoQueueContent for String {
 
 impl IntoQueueContent for Vec<Content> {
     fn into_queue_content(self) -> Vec<Content> {
-        self.into_iter()
-            .filter(|content| matches!(content, Content::Text { .. } | Content::Thinking { .. }))
-            .collect()
+        self
     }
 }
 
@@ -96,6 +95,8 @@ impl IntoQueueContent for Vec<Content> {
 pub enum SteerError {
     #[error("queued user message content is empty")]
     EmptyContent,
+    #[error("queued user message contains non-user content")]
+    InvalidContent,
     #[error("no active turn")]
     NoActiveTurn,
     #[error("expected active turn {expected}, got {actual}")]
@@ -208,6 +209,7 @@ pub(crate) struct AgentHandleInner {
     pub(crate) tool_runs: ToolRunTracker,
     pub(crate) mode: RwLock<Arc<dyn AgentMode>>,
     pub(crate) pending_mode: RwLock<Option<PendingModeChange>>,
+    pub(crate) mode_events: Mutex<VecDeque<StreamEvent>>,
     pub(crate) is_root_thread: bool,
     pub(crate) user_input_bridge: Option<Arc<dyn UserInputBridge>>,
     pub(crate) guards: RwLock<GuardSet>,
@@ -216,6 +218,9 @@ pub(crate) struct AgentHandleInner {
 pub(crate) struct PendingModeChange {
     pub(crate) mode: Arc<dyn AgentMode>,
     pub(crate) authority: ModeAuthority,
+    pub(crate) from: String,
+    pub(crate) to: String,
+    pub(crate) announced: bool,
 }
 
 pub(crate) struct AgentControl {
@@ -236,6 +241,7 @@ pub(crate) fn control_pair(
         tool_runs: ToolRunTracker::new(),
         mode: RwLock::new(Arc::new(DefaultMode)),
         pending_mode: RwLock::new(None),
+        mode_events: Mutex::new(VecDeque::new()),
         is_root_thread,
         user_input_bridge,
         guards: RwLock::new(GuardSet::default()),
