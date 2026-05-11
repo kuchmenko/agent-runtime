@@ -293,6 +293,7 @@ impl Agent {
                     &control,
                     turn + 1,
                     &[GuardTrigger::OnTurnEnd, GuardTrigger::OnSessionStop],
+                    &[],
                     &mut history,
                     &mut new_messages,
                 ) {
@@ -322,6 +323,7 @@ impl Agent {
                 });
             }
 
+            let recent_tool_calls = describe_tool_calls(&tool_calls);
             debug!(count = tool_calls.len(), "executing tool batch");
             let results = self
                 .executor
@@ -341,6 +343,7 @@ impl Agent {
                 &control,
                 turn + 1,
                 &[GuardTrigger::OnTurnEnd],
+                &recent_tool_calls,
                 &mut history,
                 &mut new_messages,
             ) {
@@ -772,6 +775,7 @@ impl Agent {
                     &control,
                     turn + 1,
                     &[GuardTrigger::OnTurnEnd, GuardTrigger::OnSessionStop],
+                    &[],
                     &mut history,
                     &mut new_messages,
                 ) {
@@ -829,6 +833,7 @@ impl Agent {
 
             debug!(count = tool_uses.len(), "executing tool batch (stream)");
             let calls = tool_uses;
+            let recent_tool_calls = describe_tool_calls(&calls);
 
             // Emit one `ToolCallPending` per call before invoking the
             // executor. The consumer's UI uses this to render an
@@ -882,6 +887,7 @@ impl Agent {
                 &control,
                 turn + 1,
                 &[GuardTrigger::OnTurnEnd],
+                &recent_tool_calls,
                 &mut history,
                 &mut new_messages,
             ) {
@@ -1015,10 +1021,18 @@ enum InjectOutcome {
     None,
 }
 
+fn describe_tool_calls(calls: &[ToolCall]) -> Vec<String> {
+    calls
+        .iter()
+        .map(|call| format!("{}:{}", call.name, call.id))
+        .collect()
+}
+
 fn inject_continuation_if_needed(
     control: &AgentControl,
     turn_count: usize,
     triggers: &[GuardTrigger],
+    recent_tool_calls: &[String],
     history: &mut Vec<Message>,
     new_messages: &mut Vec<Message>,
 ) -> InjectOutcome {
@@ -1029,7 +1043,7 @@ fn inject_continuation_if_needed(
             .rev()
             .find(|message| message.role == crate::message::Role::Assistant)
             .cloned(),
-        recent_tool_calls: Vec::new(),
+        recent_tool_calls: recent_tool_calls.to_vec(),
     };
     let mut guards = control
         .handle_inner
