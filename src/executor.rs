@@ -723,24 +723,33 @@ impl ToolExecutor {
             return (idx, self.short_circuit_result(&call));
         }
 
-        let class_sem = self.class_semaphore_for(routing);
-        let per_tool_sem = self.concurrency.per_tool.get(&call.name).cloned();
-
-        let _permits = match acquire_admission(per_tool_sem, class_sem, ctx).await {
-            Some(permits) => permits,
-            None => return (idx, cancelled_before_execution(&call.id)),
-        };
-
-        if let Some(denial) = self.mode_denial(&call, control.mode.as_deref()) {
-            return (idx, denial);
-        }
-
         let call_id = call.id.clone();
         let child_cancel = ctx.cancel.child_token();
         if let Some(tracker) = &control.tracker {
             tracker.register(&call_id, child_cancel.clone());
         }
         let child_ctx = ctx.with_cancel(child_cancel);
+
+        let class_sem = self.class_semaphore_for(routing);
+        let per_tool_sem = self.concurrency.per_tool.get(&call.name).cloned();
+
+        let _permits = match acquire_admission(per_tool_sem, class_sem, &child_ctx).await {
+            Some(permits) => permits,
+            None => {
+                if let Some(tracker) = &control.tracker {
+                    tracker.mark_done(&call_id);
+                }
+                return (idx, cancelled_before_execution(&call_id));
+            }
+        };
+
+        if let Some(denial) = self.mode_denial(&call, control.mode.as_deref()) {
+            if let Some(tracker) = &control.tracker {
+                tracker.mark_done(&call_id);
+            }
+            return (idx, denial);
+        }
+
         let content = self.execute_one(call, &child_ctx).await;
         if let Some(tracker) = &control.tracker {
             tracker.mark_done(&call_id);
