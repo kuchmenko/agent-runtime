@@ -327,13 +327,22 @@ Backpressure is real: a slow consumer parks the producer task, which closes the 
 Steering-aware callers can use `run_with_handle` / `stream_with_handle` to get an `AgentHandle` for the active run:
 
 ```rust
-let (future, handle) = agent.run_with_handle(history, CancellationToken::new());
-let task = tokio::spawn(future);
+let (mut stream, handle) = agent.stream_with_handle(history, CancellationToken::new());
 
-handle.queue_user_message("Also include post-2023 sources", handle.current_turn_id())?;
-handle.interrupt(InterruptTarget::Tool { tool_call_id: "toolu_123".into() })?;
+while let Some(event) = stream.next().await {
+    match event? {
+        StreamEvent::TurnStarted { turn_id } => {
+            handle.queue_user_message("Also include post-2023 sources", Some(turn_id))?;
+        }
+        StreamEvent::ToolCallPending { id, .. } if should_interrupt(&id) => {
+            handle.interrupt(InterruptTarget::Tool { tool_call_id: id })?;
+        }
+        StreamEvent::ContentDelta(text) => print!("{text}"),
+        _ => {}
+    }
+}
 
-let result = task.await??;
+let result = stream.into_result().await?;
 ```
 
 Queued user messages are appended at the next provider-call boundary, never mid-tool. Tool interrupts cancel only that tool's child token; the agent feeds the cancellation result back to the model and continues the turn. The same handle also exposes mode gates (`PlanMode`, `AcceptEditsMode`, custom `AgentMode`), root-thread `ask_user(...)` via a caller-provided `UserInputBridge`, and synchronous `ContinuationGuard` predicates for keep-working loops.
