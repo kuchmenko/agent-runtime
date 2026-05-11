@@ -17,11 +17,13 @@ use crate::error::{AgentError, ProviderError};
 use crate::executor::{
     AllowAll, ConcurrencyConfig, ToolCall, ToolConcurrency, ToolExecutor, ToolPolicy, ToolRegistry,
 };
+use crate::guard::{AgentSnapshot, GuardEval, GuardTrigger};
 use crate::message::{CacheControl, Content, Message, StopReason, Usage};
 use crate::provider::{LlmProvider, Request, SystemBlock, ThinkingConfig, ToolDefinition};
 use crate::steering::{self, AgentControl, SteerCommand, TurnId};
 use crate::stream::StreamEvent;
 use crate::tool::{Tool, ToolContext};
+use crate::user_input::UserInputBridge;
 
 /// Fallback `stop_reason` for partial results returned before any turn
 /// has completed (e.g. provider failure on turn 0). Documented as
@@ -99,6 +101,7 @@ pub struct Agent {
     cache_tools: Option<CacheControl>,
     thinking: Option<ThinkingConfig>,
     tool_definition_filter: Option<HashSet<String>>,
+    user_input_bridge: Option<Arc<dyn UserInputBridge>>,
 }
 
 impl Agent {
@@ -190,7 +193,11 @@ impl Agent {
         crate::AgentHandle,
     ) {
         let agent = self.clone();
-        let (control, handle) = steering::control_pair(cancel.clone());
+        let (control, handle) = steering::control_pair(
+            cancel.clone(),
+            agent.depth == 0,
+            agent.user_input_bridge.clone(),
+        );
         let future = async move { agent.run_loop(messages, cancel, control).await };
         (future, handle)
     }
@@ -210,10 +217,10 @@ impl Agent {
         let mut last_stop: Option<StopReason> = None;
 
         let tool_defs = self.tool_definitions();
-        let ctx = self.make_context(cancel.clone());
 
         for turn in 0..self.max_turns {
-            let turn_id = begin_turn(&control, turn);
+            let (turn_id, turn_cancel) = begin_turn(&control, turn, &cancel);
+            let ctx = self.make_context(turn_cancel);
             info!(turn, %turn_id, "agent turn");
 
             if cancel.is_cancelled() {
@@ -268,6 +275,16 @@ impl Agent {
                 .collect();
 
             if tool_calls.is_empty() || response.stop_reason == StopReason::EndTurn {
+                if inject_continuation_if_needed(
+                    &control,
+                    turn + 1,
+                    &mut history,
+                    &mut new_messages,
+                )
+                .is_some()
+                {
+                    continue;
+                }
                 let text = extract_text(&response.content);
                 info!(turn, "agent finished");
                 // Safe to unwrap: we just assigned `Some` above when this
@@ -298,6 +315,7 @@ impl Agent {
                     tool_calls,
                     &ctx,
                     Some(control.handle_inner.tool_runs.clone()),
+                    Some(current_mode(&control)),
                 )
                 .await;
 
@@ -392,7 +410,11 @@ impl Agent {
         trace_hook: Option<TraceHook>,
     ) -> (AgentStream, crate::AgentHandle) {
         let agent = self.clone();
-        let (control, handle) = steering::control_pair(cancel.clone());
+        let (control, handle) = steering::control_pair(
+            cancel.clone(),
+            agent.depth == 0,
+            agent.user_input_bridge.clone(),
+        );
         let (events_tx, events_rx) = mpsc::channel::<Result<StreamEvent, ProviderError>>(16);
         let (result_tx, result_rx) = oneshot::channel();
 
@@ -433,10 +455,10 @@ impl Agent {
         let mut last_stop: Option<StopReason> = None;
 
         let tool_defs = self.tool_definitions();
-        let ctx = self.make_context(cancel.clone());
 
         for turn in 0..self.max_turns {
-            let turn_id = begin_turn(&control, turn);
+            let (turn_id, turn_cancel) = begin_turn(&control, turn, &cancel);
+            let ctx = self.make_context(turn_cancel);
             info!(turn, %turn_id, "agent stream turn");
             let turn_event = StreamEvent::TurnStarted {
                 turn_id: turn_id.clone(),
@@ -670,7 +692,12 @@ impl Agent {
                     // Agent-emitted events should never arrive from a
                     // provider's stream. Ignore defensively if a buggy
                     // provider injects one.
-                    StreamEvent::TurnStarted { .. } | StreamEvent::ToolCallPending { .. } => {}
+                    StreamEvent::TurnStarted { .. }
+                    | StreamEvent::ModeChanged { .. }
+                    | StreamEvent::ModeChangeRequested { .. }
+                    | StreamEvent::ContinuationInjected { .. }
+                    | StreamEvent::GuardAborted { .. }
+                    | StreamEvent::ToolCallPending { .. } => {}
                 }
             }
             if !current_text_buf.is_empty() {
@@ -689,6 +716,27 @@ impl Agent {
             new_messages.push(assistant_msg);
 
             if tool_uses.is_empty() || resolved_stop == StopReason::EndTurn {
+                if let Some(event) = inject_continuation_if_needed(
+                    &control,
+                    turn + 1,
+                    &mut history,
+                    &mut new_messages,
+                ) {
+                    if let Some(hook) = &trace_hook {
+                        emit_trace(hook, &event);
+                    }
+                    if events_tx.send(Ok(event)).await.is_err() {
+                        return Err(AgentError::Cancelled {
+                            partial: build_partial(
+                                &new_messages,
+                                &total_usage,
+                                StopReason::Cancelled,
+                                &turn_text,
+                            ),
+                        });
+                    }
+                    continue;
+                }
                 info!(turn, "agent stream finished");
                 clear_active_turn(&control);
                 return Ok(AgentResult {
@@ -752,6 +800,7 @@ impl Agent {
                     calls,
                     &ctx,
                     Some(control.handle_inner.tool_runs.clone()),
+                    Some(current_mode(&control)),
                 )
                 .await;
             let user_msg = Message::user(results);
@@ -780,15 +829,58 @@ impl Agent {
     }
 }
 
-fn begin_turn(control: &AgentControl, turn: usize) -> TurnId {
+fn begin_turn(
+    control: &AgentControl,
+    turn: usize,
+    cancel: &CancellationToken,
+) -> (TurnId, CancellationToken) {
     let turn_id = TurnId::new();
+    let turn_cancel = cancel.child_token();
     *control
         .handle_inner
         .active_turn
         .write()
         .expect("agent handle turn lock poisoned") = Some(turn_id.clone());
+    *control
+        .handle_inner
+        .active_turn_cancel
+        .write()
+        .expect("agent handle turn cancel lock poisoned") = Some(turn_cancel.clone());
+    apply_pending_mode(control);
     debug!(turn, %turn_id, "active turn set");
-    turn_id
+    (turn_id, turn_cancel)
+}
+
+fn current_mode(control: &AgentControl) -> Arc<dyn crate::mode::AgentMode> {
+    Arc::clone(
+        &control
+            .handle_inner
+            .mode
+            .read()
+            .expect("agent mode lock poisoned"),
+    )
+}
+
+fn apply_pending_mode(control: &AgentControl) -> Option<StreamEvent> {
+    let pending = control
+        .handle_inner
+        .pending_mode
+        .write()
+        .expect("pending mode lock poisoned")
+        .take()?;
+    let mut mode = control
+        .handle_inner
+        .mode
+        .write()
+        .expect("agent mode lock poisoned");
+    let from = mode.name().to_string();
+    let to = pending.mode.name().to_string();
+    *mode = pending.mode;
+    Some(StreamEvent::ModeChanged {
+        from,
+        to,
+        authority: pending.authority,
+    })
 }
 
 fn clear_active_turn(control: &AgentControl) {
@@ -797,6 +889,55 @@ fn clear_active_turn(control: &AgentControl) {
         .active_turn
         .write()
         .expect("agent handle turn lock poisoned") = None;
+    *control
+        .handle_inner
+        .active_turn_cancel
+        .write()
+        .expect("agent handle turn cancel lock poisoned") = None;
+}
+
+fn inject_continuation_if_needed(
+    control: &AgentControl,
+    turn_count: usize,
+    history: &mut Vec<Message>,
+    new_messages: &mut Vec<Message>,
+) -> Option<StreamEvent> {
+    let snapshot = AgentSnapshot {
+        turn_count,
+        last_assistant_message: new_messages
+            .iter()
+            .rev()
+            .find(|message| message.role == crate::message::Role::Assistant)
+            .cloned(),
+        recent_tool_calls: Vec::new(),
+    };
+    let mut guards = control
+        .handle_inner
+        .guards
+        .write()
+        .expect("continuation guard lock poisoned");
+    for trigger in [GuardTrigger::OnTurnEnd, GuardTrigger::OnSessionStop] {
+        match guards.evaluate(trigger, &snapshot) {
+            GuardEval::Continue {
+                guard_name,
+                prompt,
+                iteration,
+            } => {
+                let message = Message::user_text(prompt);
+                history.push(message.clone());
+                new_messages.push(message);
+                return Some(StreamEvent::ContinuationInjected {
+                    guard_name,
+                    iteration,
+                });
+            }
+            GuardEval::Abort { guard_name, reason } => {
+                return Some(StreamEvent::GuardAborted { guard_name, reason });
+            }
+            GuardEval::Stop => {}
+        }
+    }
+    None
 }
 
 fn drain_queued_user_messages(
@@ -946,6 +1087,7 @@ pub struct AgentBuilder {
     tool_concurrencies: Vec<(String, ToolConcurrency)>,
     thinking: Option<ThinkingConfig>,
     tool_definition_filter: Option<HashSet<String>>,
+    user_input_bridge: Option<Arc<dyn UserInputBridge>>,
 }
 
 impl AgentBuilder {
@@ -970,6 +1112,7 @@ impl AgentBuilder {
             tool_concurrencies: Vec::new(),
             thinking: None,
             tool_definition_filter: None,
+            user_input_bridge: None,
         }
     }
 
@@ -1055,6 +1198,11 @@ impl AgentBuilder {
     /// agent tree.
     pub fn approval(mut self, approval: impl ApprovalHandler + 'static) -> Self {
         self.approval = Some(Arc::new(approval));
+        self
+    }
+
+    pub fn user_input_bridge(mut self, bridge: impl UserInputBridge + 'static) -> Self {
+        self.user_input_bridge = Some(Arc::new(bridge));
         self
     }
 
@@ -1264,6 +1412,7 @@ impl AgentBuilder {
             cache_tools: self.cache_tools,
             thinking: self.thinking,
             tool_definition_filter: self.tool_definition_filter,
+            user_input_bridge: self.user_input_bridge,
         })
     }
 

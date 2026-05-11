@@ -1169,6 +1169,10 @@ async fn subagent_trace_hook_receives_full_child_stream_events() {
             tkach::tools::SubAgent::new(child, "child").trace_hook(move |ev| {
                 let tag = match ev {
                     StreamEvent::TurnStarted { .. } => "turn_started",
+                    StreamEvent::ModeChanged { .. } => "mode_changed",
+                    StreamEvent::ModeChangeRequested { .. } => "mode_change_requested",
+                    StreamEvent::ContinuationInjected { .. } => "continuation_injected",
+                    StreamEvent::GuardAborted { .. } => "guard_aborted",
                     StreamEvent::ContentDelta(_) => "content_delta",
                     StreamEvent::ThinkingDelta { .. } => "thinking_delta",
                     StreamEvent::ThinkingBlock { .. } => "thinking_block",
@@ -1278,6 +1282,10 @@ async fn subagent_trace_hook_observes_tool_call_path() {
                 .trace_hook(move |ev| {
                     let tag = match ev {
                         StreamEvent::TurnStarted { .. } => "turn_started",
+                        StreamEvent::ModeChanged { .. } => "mode_changed",
+                        StreamEvent::ModeChangeRequested { .. } => "mode_change_requested",
+                        StreamEvent::ContinuationInjected { .. } => "continuation_injected",
+                        StreamEvent::GuardAborted { .. } => "guard_aborted",
                         StreamEvent::ContentDelta(_) => "content_delta",
                         StreamEvent::ThinkingDelta { .. } => "thinking_delta",
                         StreamEvent::ThinkingBlock { .. } => "thinking_block",

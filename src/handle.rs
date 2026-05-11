@@ -1,14 +1,19 @@
 //! Caller-facing handle for steering a running agent.
 
+use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::Duration;
 
+use crate::guard::{ContinuationGuard, GuardError, GuardId};
+use crate::mode::{AgentMode, ModeAuthority, ModeError};
 use crate::steering::{
     AgentHandleInner, InterruptError, InterruptOutcome, InterruptTarget, IntoQueueContent,
-    SteerCommand, SteerError, TurnId,
+    PendingModeChange, SteerCommand, SteerError, TurnId,
 };
+use crate::user_input::{self, AskUserError, QuestionSet, UserInputResponse};
 
 /// Cheap cloneable control handle for a running agent.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AgentHandle {
     pub(crate) inner: Arc<AgentHandleInner>,
 }
@@ -65,8 +70,18 @@ impl AgentHandle {
                 if active.as_ref() != Some(&turn_id) {
                     return Err(InterruptError::UnknownTurn(turn_id));
                 }
-                self.inner.cancel.cancel();
-                Ok(InterruptOutcome::Cancelled)
+                if let Some(cancel) = self
+                    .inner
+                    .active_turn_cancel
+                    .read()
+                    .expect("agent handle turn cancel lock poisoned")
+                    .as_ref()
+                {
+                    cancel.cancel();
+                    Ok(InterruptOutcome::Cancelled)
+                } else {
+                    Ok(InterruptOutcome::NotInFlight)
+                }
             }
             InterruptTarget::Session => {
                 self.inner.cancel.cancel();
@@ -82,5 +97,81 @@ impl AgentHandle {
             .read()
             .expect("agent handle turn lock poisoned")
             .clone()
+    }
+
+    pub fn set_mode(
+        &self,
+        mode: Box<dyn AgentMode>,
+        authority: ModeAuthority,
+    ) -> Result<(), ModeError> {
+        let mode: Arc<dyn AgentMode> = Arc::from(mode);
+        match authority {
+            ModeAuthority::Operator => {
+                *self.inner.mode.write().expect("agent mode lock poisoned") = mode;
+            }
+            ModeAuthority::Agent => {
+                *self
+                    .inner
+                    .pending_mode
+                    .write()
+                    .expect("pending mode lock poisoned") =
+                    Some(PendingModeChange { mode, authority });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn current_mode(&self) -> Cow<'static, str> {
+        self.inner
+            .mode
+            .read()
+            .expect("agent mode lock poisoned")
+            .name()
+    }
+
+    pub fn cancel_pending_mode_change(&self) -> Result<(), ModeError> {
+        let mut pending = self
+            .inner
+            .pending_mode
+            .write()
+            .expect("pending mode lock poisoned");
+        if pending.take().is_some() {
+            Ok(())
+        } else {
+            Err(ModeError::NoPendingModeChange)
+        }
+    }
+
+    pub async fn ask_user(
+        &self,
+        questions: QuestionSet,
+        timeout: Duration,
+    ) -> Result<UserInputResponse, AskUserError> {
+        if !self.inner.is_root_thread {
+            return Err(AskUserError::NotRootThread);
+        }
+        let Some(bridge) = &self.inner.user_input_bridge else {
+            return Err(AskUserError::NoUserInputBridge);
+        };
+        Ok(user_input::collect_with_timeout(bridge.as_ref(), &questions, timeout).await?)
+    }
+
+    pub fn install_continuation_guard(
+        &self,
+        guard: ContinuationGuard,
+    ) -> Result<GuardId, GuardError> {
+        self.inner
+            .guards
+            .write()
+            .expect("continuation guard lock poisoned")
+            .install(guard)
+    }
+
+    pub fn remove_continuation_guard(&self, id: GuardId) -> Result<(), GuardError> {
+        self.inner
+            .guards
+            .write()
+            .expect("continuation guard lock poisoned")
+            .remove(id)
     }
 }

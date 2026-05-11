@@ -61,6 +61,7 @@ use tracing::warn;
 
 use crate::approval::{ApprovalDecision, ApprovalHandler, AutoApprove};
 use crate::message::Content;
+use crate::mode::{AgentMode, ModeDecision};
 use crate::steering::ToolRunTracker;
 use crate::tool::{Tool, ToolClass, ToolContext};
 
@@ -601,7 +602,8 @@ impl ToolExecutor {
     /// tool_use→tool_result invariant the agent loop relies on is
     /// preserved.
     pub async fn execute_batch(&self, calls: Vec<ToolCall>, ctx: &ToolContext) -> Vec<Content> {
-        self.execute_batch_with_tracker(calls, ctx, None).await
+        self.execute_batch_with_tracker(calls, ctx, None, None)
+            .await
     }
 
     pub(crate) async fn execute_batch_with_tracker(
@@ -609,6 +611,7 @@ impl ToolExecutor {
         calls: Vec<ToolCall>,
         ctx: &ToolContext,
         tracker: Option<ToolRunTracker>,
+        mode: Option<Arc<dyn AgentMode>>,
     ) -> Vec<Content> {
         if calls.is_empty() {
             return Vec::new();
@@ -617,6 +620,7 @@ impl ToolExecutor {
             return all_cancelled_before_execution(calls);
         }
 
+        let control = DispatchControl { tracker, mode };
         let n = calls.len();
         let routings: Vec<RoutingClass> = calls.iter().map(|c| self.routing_class(c)).collect();
         let mut calls: Vec<Option<ToolCall>> = calls.into_iter().map(Some).collect();
@@ -635,7 +639,7 @@ impl ToolExecutor {
                 &routings,
                 i..j,
                 ctx,
-                tracker.clone(),
+                control.clone(),
             )
             .await;
             i = j;
@@ -657,14 +661,14 @@ impl ToolExecutor {
         routings: &[RoutingClass],
         range: std::ops::Range<usize>,
         ctx: &ToolContext,
-        tracker: Option<ToolRunTracker>,
+        control: DispatchControl,
     ) {
         let mut futs = FuturesUnordered::new();
         for k in range {
             let call = calls[k]
                 .take()
                 .expect("each slot taken exactly once during dispatch");
-            futs.push(self.dispatch_one(k, call, routings[k], ctx, tracker.clone()));
+            futs.push(self.dispatch_one(k, call, routings[k], ctx, control.clone()));
         }
         while let Some((idx, content)) = futs.next().await {
             slots[idx] = Some(content);
@@ -713,7 +717,7 @@ impl ToolExecutor {
         call: ToolCall,
         routing: RoutingClass,
         ctx: &ToolContext,
-        tracker: Option<ToolRunTracker>,
+        control: DispatchControl,
     ) -> (usize, Content) {
         if matches!(routing, RoutingClass::ShortCircuit) {
             return (idx, self.short_circuit_result(&call));
@@ -727,17 +731,46 @@ impl ToolExecutor {
             None => return (idx, cancelled_before_execution(&call.id)),
         };
 
+        if let Some(denial) = self.mode_denial(&call, control.mode.as_deref()) {
+            return (idx, denial);
+        }
+
         let call_id = call.id.clone();
         let child_cancel = ctx.cancel.child_token();
-        if let Some(tracker) = &tracker {
+        if let Some(tracker) = &control.tracker {
             tracker.register(&call_id, child_cancel.clone());
         }
         let child_ctx = ctx.with_cancel(child_cancel);
         let content = self.execute_one(call, &child_ctx).await;
-        if let Some(tracker) = &tracker {
+        if let Some(tracker) = &control.tracker {
             tracker.mark_done(&call_id);
         }
         (idx, content)
+    }
+
+    fn mode_denial(&self, call: &ToolCall, mode: Option<&dyn AgentMode>) -> Option<Content> {
+        let mode = mode?;
+        let tool = self.registry.get(&call.name)?;
+        let class = tool.class();
+        let decision = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mode.tool_gate(&call.name, class).unwrap_or_else(|| {
+                if class == ToolClass::Mutating && !mode.allows_mutating_tools() {
+                    ModeDecision::Deny {
+                        reason: format!("mode '{}' denies mutating tools", mode.name()).into(),
+                    }
+                } else {
+                    ModeDecision::Allow
+                }
+            })
+        }));
+        match decision {
+            Ok(ModeDecision::Allow) | Err(_) => None,
+            Ok(ModeDecision::Deny { reason }) => Some(Content::tool_result(
+                &call.id,
+                format!("Error: mode denied tool '{}' — {reason}", call.name),
+                true,
+            )),
+        }
     }
 
     /// Build the error `tool_result` for a denied or missing tool —
@@ -764,6 +797,12 @@ impl ToolExecutor {
             }
         }
     }
+}
+
+#[derive(Clone)]
+struct DispatchControl {
+    tracker: Option<ToolRunTracker>,
+    mode: Option<Arc<dyn AgentMode>>,
 }
 
 enum AcquireOutcome {

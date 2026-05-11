@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::guard::GuardSet;
 use crate::message::Content;
+use crate::mode::{AgentMode, DefaultMode, ModeAuthority};
+use crate::user_input::UserInputBridge;
 
 static TURN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -182,12 +185,22 @@ impl ToolRunTracker {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct AgentHandleInner {
     pub(crate) active_turn: RwLock<Option<TurnId>>,
+    pub(crate) active_turn_cancel: RwLock<Option<CancellationToken>>,
     pub(crate) steer_tx: mpsc::UnboundedSender<SteerCommand>,
     pub(crate) cancel: CancellationToken,
     pub(crate) tool_runs: ToolRunTracker,
+    pub(crate) mode: RwLock<Arc<dyn AgentMode>>,
+    pub(crate) pending_mode: RwLock<Option<PendingModeChange>>,
+    pub(crate) is_root_thread: bool,
+    pub(crate) user_input_bridge: Option<Arc<dyn UserInputBridge>>,
+    pub(crate) guards: RwLock<GuardSet>,
+}
+
+pub(crate) struct PendingModeChange {
+    pub(crate) mode: Arc<dyn AgentMode>,
+    pub(crate) authority: ModeAuthority,
 }
 
 pub(crate) struct AgentControl {
@@ -197,13 +210,21 @@ pub(crate) struct AgentControl {
 
 pub(crate) fn control_pair(
     cancel: CancellationToken,
+    is_root_thread: bool,
+    user_input_bridge: Option<Arc<dyn UserInputBridge>>,
 ) -> (AgentControl, crate::handle::AgentHandle) {
     let (steer_tx, steer_rx) = mpsc::unbounded_channel();
     let inner = Arc::new(AgentHandleInner {
         active_turn: RwLock::new(None),
+        active_turn_cancel: RwLock::new(None),
         steer_tx,
         cancel,
         tool_runs: ToolRunTracker::new(),
+        mode: RwLock::new(Arc::new(DefaultMode)),
+        pending_mode: RwLock::new(None),
+        is_root_thread,
+        user_input_bridge,
+        guards: RwLock::new(GuardSet::default()),
     });
     let control = AgentControl {
         handle_inner: Arc::clone(&inner),

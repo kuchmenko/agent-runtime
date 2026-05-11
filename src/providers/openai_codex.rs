@@ -279,7 +279,12 @@ impl LlmProvider for OpenAICodex {
                     flush_text(&mut text_buf, &mut content);
                     content.push(Content::ToolUse { id, name, input });
                 }
-                StreamEvent::TurnStarted { .. } | StreamEvent::ToolCallPending { .. } => {}
+                StreamEvent::TurnStarted { .. }
+                | StreamEvent::ModeChanged { .. }
+                | StreamEvent::ModeChangeRequested { .. }
+                | StreamEvent::ContinuationInjected { .. }
+                | StreamEvent::GuardAborted { .. }
+                | StreamEvent::ToolCallPending { .. } => {}
                 StreamEvent::MessageDelta { stop_reason: sr } => stop_reason = sr,
                 StreamEvent::Usage(u) => usage = u,
                 StreamEvent::Done => break,

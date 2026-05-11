@@ -256,3 +256,161 @@ async fn stream_with_handle_emits_turn_started() {
     let result = stream.collect_result().await.unwrap();
     assert_eq!(result.text, "hello");
 }
+
+struct MutatingProbe;
+
+#[async_trait]
+impl Tool for MutatingProbe {
+    fn name(&self) -> &str {
+        "mutate"
+    }
+    fn description(&self) -> &str {
+        "mutate"
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+    fn class(&self) -> ToolClass {
+        ToolClass::Mutating
+    }
+    async fn execute(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("mutated"))
+    }
+}
+
+#[tokio::test]
+async fn plan_mode_denies_mutating_tool_without_approval() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = Arc::clone(&calls);
+    let mock = Mock::new(move |req| {
+        let n = calls_clone.fetch_add(1, Ordering::SeqCst);
+        match n {
+            0 => Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "m1".into(),
+                    name: "mutate".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            }),
+            _ => {
+                let denied = req.messages.iter().any(|m| {
+                    m.content.iter().any(|c| match c {
+                        Content::ToolResult {
+                            content, is_error, ..
+                        } => *is_error && content.contains("mode denied"),
+                        _ => false,
+                    })
+                });
+                assert!(denied, "PlanMode did not deny mutating tool");
+                Ok(Response {
+                    content: vec![Content::text("planned")],
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage::default(),
+                })
+            }
+        }
+    });
+    let agent = Agent::builder()
+        .provider(mock)
+        .model("test")
+        .tool(MutatingProbe)
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let (future, handle) = agent.run_with_handle(prompt("start"), CancellationToken::new());
+    handle
+        .set_mode(Box::new(tkach::PlanMode), tkach::ModeAuthority::Operator)
+        .unwrap();
+    let result = future.await.unwrap();
+    assert_eq!(result.text, "planned");
+}
+
+struct TestBridge;
+
+#[async_trait]
+impl tkach::UserInputBridge for TestBridge {
+    async fn collect(
+        &self,
+        _questions: &tkach::QuestionSet,
+    ) -> Result<tkach::UserInputResponse, tkach::BridgeError> {
+        Ok(tkach::UserInputResponse::Cancelled)
+    }
+}
+
+#[tokio::test]
+async fn root_handle_can_ask_user_via_bridge() {
+    let agent = Agent::builder()
+        .provider(Mock::with_text("hello"))
+        .model("test")
+        .user_input_bridge(TestBridge)
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+    let (_future, handle) = agent.run_with_handle(prompt("hi"), CancellationToken::new());
+    let response = handle
+        .ask_user(
+            tkach::QuestionSet {
+                questions: Vec::new(),
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response, tkach::UserInputResponse::Cancelled);
+}
+
+#[tokio::test]
+async fn continuation_guard_injects_until_predicate_stops() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = Arc::clone(&calls);
+    let mock = Mock::new(move |req| {
+        let n = calls_clone.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            Ok(Response {
+                content: vec![Content::text("first")],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        } else {
+            assert!(
+                req.messages
+                    .iter()
+                    .any(|m| m.text().contains("continue please"))
+            );
+            Ok(Response {
+                content: vec![Content::text("second")],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    });
+    let agent = Agent::builder()
+        .provider(mock)
+        .model("test")
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+    let (future, handle) = agent.run_with_handle(prompt("hi"), CancellationToken::new());
+    handle
+        .install_continuation_guard(tkach::ContinuationGuard {
+            name: "once".into(),
+            trigger: tkach::GuardTrigger::OnTurnEnd,
+            predicate: Box::new(|snapshot| {
+                if snapshot.turn_count == 1 {
+                    tkach::GuardDecision::Continue
+                } else {
+                    tkach::GuardDecision::Stop
+                }
+            }),
+            continuation_prompt: "continue please".into(),
+            max_iterations: Some(1),
+            escape: tkach::GuardEscape::MaxIterations,
+        })
+        .unwrap();
+
+    let result = future.await.unwrap();
+    assert_eq!(result.text, "second");
+}

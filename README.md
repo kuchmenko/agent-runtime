@@ -336,7 +336,7 @@ handle.interrupt(InterruptTarget::Tool { tool_call_id: "toolu_123".into() })?;
 let result = task.await??;
 ```
 
-Queued user messages are appended at the next provider-call boundary, never mid-tool. Tool interrupts cancel only that tool's child token; the agent feeds the cancellation result back to the model and continues the turn.
+Queued user messages are appended at the next provider-call boundary, never mid-tool. Tool interrupts cancel only that tool's child token; the agent feeds the cancellation result back to the model and continues the turn. The same handle also exposes mode gates (`PlanMode`, `AcceptEditsMode`, custom `AgentMode`), root-thread `ask_user(...)` via a caller-provided `UserInputBridge`, and synchronous `ContinuationGuard` predicates for keep-working loops.
 
 See [`examples/streaming_cancel.rs`](./examples/streaming_cancel.rs) for live cancel timing.
 

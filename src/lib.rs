@@ -33,8 +33,10 @@ pub mod agent;
 pub mod approval;
 pub mod error;
 pub mod executor;
+pub mod guard;
 pub mod handle;
 pub mod message;
+pub mod mode;
 pub mod model;
 pub mod policy;
 pub mod provider;
@@ -43,6 +45,7 @@ pub mod steering;
 pub mod stream;
 pub mod tool;
 pub mod tools;
+pub mod user_input;
 
 // Re-export core types at the crate root for convenience.
 pub use agent::{Agent, AgentBuilder, AgentResult, AgentStream, BuildError};
@@ -51,10 +54,16 @@ pub use error::{AgentError, ProviderError, ToolError};
 pub use executor::{
     AllowAll, ConcurrencyConfig, ToolCall, ToolConcurrency, ToolExecutor, ToolPolicy, ToolRegistry,
 };
+pub use guard::{
+    AgentSnapshot, ContinuationGuard, GuardDecision, GuardError, GuardEscape, GuardId, GuardTrigger,
+};
 pub use handle::AgentHandle;
 pub use message::{
     CacheControl, CacheTtl, Content, Message, Role, StopReason, ThinkingMetadata, ThinkingProvider,
     Usage,
+};
+pub use mode::{
+    AcceptEditsMode, AgentMode, DefaultMode, ModeAuthority, ModeDecision, ModeError, PlanMode,
 };
 pub use policy::{AllowList, IntersectPolicy};
 pub use provider::{
@@ -67,3 +76,7 @@ pub use steering::{
 pub use stream::{ProviderEventStream, StreamEvent};
 pub use tokio_util::sync::CancellationToken;
 pub use tool::{Tool, ToolClass, ToolContext, ToolOutput};
+pub use user_input::{
+    Answer, AskUserError, BridgeError, Question, QuestionOption, QuestionSet, UserInputBridge,
+    UserInputResponse,
+};
