@@ -111,6 +111,13 @@ impl CodexCredentialsProvider for StaticCredentials {
 }
 
 /// Provider for the ChatGPT subscription Codex backend.
+///
+/// **Per-call thinking precedence:** same as
+/// [`super::OpenAIResponses`]. [`crate::ThinkingConfig::Effort`]
+/// overrides instance defaults set via [`Self::with_reasoning_effort`].
+/// [`crate::ThinkingConfig::Disabled`] drops both effort and summary.
+/// [`crate::ThinkingConfig::Budget`] is **Anthropic-style and silently
+/// ignored** — the instance defaults apply.
 pub struct OpenAICodex {
     credentials: Arc<dyn CodexCredentialsProvider>,
     client: reqwest::Client,
@@ -560,5 +567,81 @@ mod tests {
             provider.responses_url(),
             "http://localhost:1234/api/codex/responses"
         );
+    }
+}
+
+#[cfg(test)]
+mod thinking_override_tests {
+    //! Per-call `Request.thinking` precedence tests for the Codex
+    //! provider. Mirrors the Anthropic/OpenAIResponses tests; covers
+    //! issue #40 Phase 2 acceptance criteria.
+    use super::*;
+    use crate::message::Message;
+    use crate::provider::{ThinkingConfig, ThinkingEffort};
+
+    fn req_with(thinking: Option<ThinkingConfig>) -> Request {
+        Request {
+            model: "gpt-5-codex".into(),
+            system: None,
+            messages: vec![Message::user_text("hi")],
+            tools: vec![],
+            max_tokens: 64,
+            temperature: None,
+            thinking,
+        }
+    }
+
+    #[test]
+    fn effort_high_emits_wire_reasoning_effort_high() {
+        let r = req_with(Some(ThinkingConfig::Effort(ThinkingEffort::High)));
+        let effort = effective_reasoning_effort(&r, None);
+        let summary = effective_reasoning_summary(&r, None);
+        let body = build_request_body(&r, effort.as_ref(), summary.as_ref());
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn per_call_effort_overrides_instance() {
+        let r = req_with(Some(ThinkingConfig::Effort(ThinkingEffort::Low)));
+        let effort = effective_reasoning_effort(&r, Some(&OpenAIEffort::High));
+        let summary = effective_reasoning_summary(&r, Some(&OpenAISummary::Detailed));
+        let body = build_request_body(&r, effort.as_ref(), summary.as_ref());
+        assert_eq!(body["reasoning"]["effort"], "low");
+        assert_eq!(body["reasoning"]["summary"], "detailed");
+    }
+
+    #[test]
+    fn disabled_drops_reasoning_block() {
+        let r = req_with(Some(ThinkingConfig::Disabled));
+        let effort = effective_reasoning_effort(&r, Some(&OpenAIEffort::High));
+        let summary = effective_reasoning_summary(&r, Some(&OpenAISummary::Auto));
+        let body = build_request_body(&r, effort.as_ref(), summary.as_ref());
+        assert!(
+            body.get("reasoning").is_none(),
+            "Disabled must drop reasoning entirely; got {body:?}"
+        );
+    }
+
+    #[test]
+    fn budget_falls_back_to_instance_silently() {
+        // Same contract as OpenAIResponses: Budget is Anthropic-style;
+        // Codex ignores and applies instance defaults.
+        let r = req_with(Some(ThinkingConfig::Budget(8192)));
+        let effort = effective_reasoning_effort(&r, Some(&OpenAIEffort::Medium));
+        let summary = effective_reasoning_summary(&r, Some(&OpenAISummary::Auto));
+        let body = build_request_body(&r, effort.as_ref(), summary.as_ref());
+        assert_eq!(body["reasoning"]["effort"], "medium");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
+    fn other_effort_passes_through_verbatim() {
+        let r = req_with(Some(ThinkingConfig::Effort(ThinkingEffort::Other(
+            "xhigh".into(),
+        ))));
+        let effort = effective_reasoning_effort(&r, None);
+        let summary = effective_reasoning_summary(&r, None);
+        let body = build_request_body(&r, effort.as_ref(), summary.as_ref());
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
     }
 }
