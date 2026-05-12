@@ -10,8 +10,8 @@ use tkach::provider::{LlmProvider, Request, Response};
 use tkach::providers::Mock;
 use tkach::stream::ProviderEventStream;
 use tkach::{
-    Agent, CancellationToken, InterruptOutcome, InterruptTarget, StreamEvent, Tool, ToolClass,
-    ToolContext, ToolError, ToolOutput, TurnId,
+    Agent, CancellationToken, InterruptOutcome, InterruptTarget, PolicyScope, PolicyTrigger,
+    PromptPolicy, StreamEvent, Tool, ToolClass, ToolContext, ToolError, ToolOutput, TurnId,
 };
 use tokio::sync::Notify;
 
@@ -119,6 +119,113 @@ async fn queued_user_message_drains_before_next_provider_request() {
             .iter()
             .any(|m| m.text() == "queued fact")
     );
+}
+
+#[tokio::test]
+async fn next_turn_prompt_policy_applies_once_to_next_provider_request() {
+    let started = Arc::new(Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = Arc::clone(&calls);
+
+    let mock = Mock::new(move |req| {
+        let n = calls_clone.fetch_add(1, Ordering::SeqCst);
+        match n {
+            0 => Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "slow-1".into(),
+                    name: "slow".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            }),
+            _ => {
+                let system = req
+                    .system
+                    .as_ref()
+                    .expect("policy should create system blocks");
+                assert!(
+                    system.iter().any(|block| block.text.contains(
+                        "<!-- runtime policy: stay-focused -->\nPrefer diagnosis before code."
+                    )),
+                    "runtime policy was not added to the system prompt: {system:?}"
+                );
+                Ok(Response {
+                    content: vec![Content::text("final")],
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage::default(),
+                })
+            }
+        }
+    });
+
+    let agent = Agent::builder()
+        .provider(mock)
+        .model("test")
+        .tool(SlowTool {
+            started: Arc::clone(&started),
+            delay: Duration::from_millis(50),
+        })
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let (future, handle) = agent.run_with_handle(prompt("start"), CancellationToken::new());
+    let task = tokio::spawn(future);
+
+    started.notified().await;
+    let id = handle
+        .install_prompt_policy(PromptPolicy {
+            name: "stay-focused".into(),
+            scope: PolicyScope::NextTurn,
+            content: "Prefer diagnosis before code.".into(),
+            precedence: 10,
+            trigger: PolicyTrigger::Always,
+        })
+        .unwrap();
+    assert_eq!(handle.list_prompt_policies().len(), 1);
+
+    let result = task.await.unwrap().unwrap();
+    assert_eq!(result.text, "final");
+    assert!(handle.list_prompt_policies().is_empty());
+    assert!(matches!(
+        handle.remove_prompt_policy(id),
+        Err(tkach::PolicyError::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn prompt_policy_rejects_duplicate_precedence() {
+    let agent = Agent::builder()
+        .provider(Mock::with_text("ok"))
+        .model("test")
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+    let (_future, handle) = agent.run_with_handle(prompt("hi"), CancellationToken::new());
+
+    handle
+        .install_prompt_policy(PromptPolicy {
+            name: "first".into(),
+            scope: PolicyScope::EveryTurnUntilRemoved,
+            content: "first".into(),
+            precedence: 7,
+            trigger: PolicyTrigger::Always,
+        })
+        .unwrap();
+    let err = handle
+        .install_prompt_policy(PromptPolicy {
+            name: "second".into(),
+            scope: PolicyScope::EveryTurnUntilRemoved,
+            content: "second".into(),
+            precedence: 7,
+            trigger: PolicyTrigger::Always,
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        tkach::PolicyError::DuplicatePrecedence { precedence: 7, .. }
+    ));
 }
 
 #[tokio::test]

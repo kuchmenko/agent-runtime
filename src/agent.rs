@@ -18,7 +18,7 @@ use crate::executor::{
     AllowAll, ConcurrencyConfig, ToolCall, ToolConcurrency, ToolExecutor, ToolPolicy, ToolRegistry,
 };
 use crate::guard::{AgentSnapshot, GuardEval, GuardTrigger};
-use crate::message::{CacheControl, Content, Message, StopReason, Usage};
+use crate::message::{CacheControl, Content, Message, Role, StopReason, Usage};
 use crate::provider::{LlmProvider, Request, SystemBlock, ThinkingConfig, ToolDefinition};
 use crate::steering::{self, ActiveTurn, AgentControl, SteerCommand, TurnId};
 use crate::stream::StreamEvent;
@@ -230,9 +230,11 @@ impl Agent {
                 });
             }
 
+            let (system, _policy_event) =
+                system_for_turn(&self.system, &control, turn, &new_messages, &turn_id);
             let request = Request {
                 model: self.model.clone(),
-                system: system_with_mode(&self.system, &control),
+                system,
                 messages: history.clone(),
                 tools: tool_defs.clone(),
                 max_tokens: self.max_tokens,
@@ -538,9 +540,20 @@ impl Agent {
                 });
             }
 
+            let (system, policy_event) =
+                system_for_turn(&self.system, &control, turn, &new_messages, &turn_id);
+            emit_policy_event(
+                policy_event,
+                &events_tx,
+                &trace_hook,
+                &new_messages,
+                &total_usage,
+            )
+            .await?;
+
             let request = Request {
                 model: self.model.clone(),
-                system: system_with_mode(&self.system, &control),
+                system,
                 messages: history.clone(),
                 tools: tool_defs.clone(),
                 max_tokens: self.max_tokens,
@@ -765,6 +778,9 @@ impl Agent {
                     | StreamEvent::ModeChangeRequested { .. }
                     | StreamEvent::ContinuationInjected { .. }
                     | StreamEvent::GuardAborted { .. }
+                    | StreamEvent::PolicyInstalled { .. }
+                    | StreamEvent::PolicyRemoved { .. }
+                    | StreamEvent::PolicyApplied { .. }
                     | StreamEvent::ToolCallPending { .. } => {}
                 }
             }
@@ -1018,17 +1034,56 @@ fn begin_turn(
     (turn_id, turn_cancel, mode_event)
 }
 
-fn system_with_mode(
+fn system_for_turn(
     base: &Option<Vec<SystemBlock>>,
     control: &AgentControl,
-) -> Option<Vec<SystemBlock>> {
-    let addendum = current_mode(control).system_prompt_addendum();
-    if addendum.is_empty() {
-        return base.clone();
-    }
+    turn_count: usize,
+    new_messages: &[Message],
+    turn_id: &TurnId,
+) -> (Option<Vec<SystemBlock>>, Option<StreamEvent>) {
     let mut system = base.clone().unwrap_or_default();
-    system.push(SystemBlock::text(addendum.into_owned()));
-    Some(system)
+
+    let addendum = current_mode(control).system_prompt_addendum();
+    if !addendum.is_empty() {
+        system.push(SystemBlock::text(addendum.into_owned()));
+    }
+
+    let snapshot = AgentSnapshot {
+        turn_count,
+        last_assistant_message: new_messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::Assistant)
+            .cloned(),
+        recent_tool_calls: Vec::new(),
+    };
+    let applied = control
+        .handle_inner
+        .prompt_policies
+        .write()
+        .expect("prompt policy lock poisoned")
+        .apply(&snapshot);
+    let event = if applied.is_empty() {
+        None
+    } else {
+        let ids = applied.iter().map(|policy| policy.id).collect();
+        for policy in applied {
+            system.push(SystemBlock::text(format!(
+                "<!-- runtime policy: {} -->\n{}",
+                policy.name, policy.content
+            )));
+        }
+        Some(StreamEvent::PolicyApplied {
+            turn_id: turn_id.clone(),
+            policy_ids: ids,
+        })
+    };
+
+    if system.is_empty() {
+        (None, event)
+    } else {
+        (Some(system), event)
+    }
 }
 
 fn current_mode(control: &AgentControl) -> Arc<dyn crate::mode::AgentMode> {
@@ -1039,6 +1094,27 @@ fn current_mode(control: &AgentControl) -> Arc<dyn crate::mode::AgentMode> {
             .read()
             .expect("agent mode lock poisoned"),
     )
+}
+
+async fn emit_policy_event(
+    event: Option<StreamEvent>,
+    events_tx: &mpsc::Sender<Result<StreamEvent, ProviderError>>,
+    trace_hook: &Option<TraceHook>,
+    new_messages: &[Message],
+    total_usage: &Usage,
+) -> Result<(), AgentError> {
+    let Some(event) = event else {
+        return Ok(());
+    };
+    if let Some(hook) = trace_hook {
+        emit_trace(hook, &event);
+    }
+    if events_tx.send(Ok(event)).await.is_err() {
+        return Err(AgentError::Cancelled {
+            partial: build_partial(new_messages, total_usage, StopReason::Cancelled, ""),
+        });
+    }
+    Ok(())
 }
 
 async fn emit_drained_mode_events(

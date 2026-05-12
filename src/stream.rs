@@ -20,6 +20,7 @@ use serde_json::Value;
 use crate::error::ProviderError;
 use crate::message::{StopReason, ThinkingMetadata, ThinkingProvider, Usage};
 use crate::mode::ModeAuthority;
+use crate::prompt_policy::PolicyId;
 use crate::steering::TurnId;
 use crate::tool::ToolClass;
 
@@ -56,6 +57,18 @@ pub enum StreamEvent {
 
     /// Agent-level event fired when a continuation guard aborts or panics.
     GuardAborted { guard_name: String, reason: String },
+
+    /// Agent-level event fired when a prompt policy is installed.
+    PolicyInstalled { policy_id: PolicyId },
+
+    /// Agent-level event fired when a prompt policy is removed.
+    PolicyRemoved { policy_id: PolicyId },
+
+    /// Agent-level event fired when prompt policies are added to a provider request.
+    PolicyApplied {
+        turn_id: TurnId,
+        policy_ids: Vec<PolicyId>,
+    },
 
     /// A piece of assistant text. Concatenate in order to reconstruct
     /// the full reply.
