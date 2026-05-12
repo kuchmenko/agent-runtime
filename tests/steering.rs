@@ -264,6 +264,102 @@ async fn intent_match_prompt_policy_observes_recent_tool_calls() {
 }
 
 #[tokio::test]
+async fn intent_match_prompt_policy_clears_tool_context_after_text_turn() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = Arc::clone(&calls);
+    let mock = Mock::new(
+        move |req| match calls_clone.fetch_add(1, Ordering::SeqCst) {
+            0 => Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "slow-stale".into(),
+                    name: "slow".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            }),
+            1 => {
+                assert!(
+                    req.system
+                        .as_ref()
+                        .is_some_and(|system| system.iter().any(|block| block.text.contains(
+                            "<!-- runtime policy: after-slow -->\nMention the slow tool."
+                        ))),
+                    "policy should match immediately after the tool batch"
+                );
+                Ok(Response {
+                    content: vec![Content::text("not done")],
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage::default(),
+                })
+            }
+            _ => {
+                assert!(
+                    req.system.is_none(),
+                    "tool-call policy must not see stale tool context after a text-only turn: {:?}",
+                    req.system
+                );
+                Ok(Response {
+                    content: vec![Content::text("final")],
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage::default(),
+                })
+            }
+        },
+    );
+
+    let agent = Agent::builder()
+        .provider(mock)
+        .model("test")
+        .tool(SlowTool {
+            started: Arc::new(Notify::new()),
+            delay: Duration::from_millis(1),
+        })
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let (future, handle) = agent.run_with_handle(prompt("start"), CancellationToken::new());
+    handle
+        .install_prompt_policy(PromptPolicy {
+            name: "after-slow".into(),
+            scope: PolicyScope::EveryTurnUntilRemoved,
+            content: "Mention the slow tool.".into(),
+            precedence: 10,
+            trigger: PolicyTrigger::OnIntentMatch(Box::new(|snapshot: &tkach::AgentSnapshot| {
+                snapshot
+                    .recent_tool_calls
+                    .iter()
+                    .any(|call| call == "slow:slow-stale")
+            })),
+        })
+        .unwrap();
+    handle
+        .install_continuation_guard(tkach::ContinuationGuard {
+            name: "continue-after-text".into(),
+            trigger: tkach::GuardTrigger::OnTurnEnd,
+            predicate: Box::new(|snapshot| {
+                if snapshot
+                    .last_assistant_message
+                    .as_ref()
+                    .is_some_and(|message| message.text() == "not done")
+                {
+                    tkach::GuardDecision::Continue
+                } else {
+                    tkach::GuardDecision::Stop
+                }
+            }),
+            continuation_prompt: "continue".into(),
+            max_iterations: Some(1),
+            escape: tkach::GuardEscape::MaxIterations,
+        })
+        .unwrap();
+
+    let result = future.await.unwrap();
+    assert_eq!(result.text, "final");
+}
+
+#[tokio::test]
 async fn intent_match_prompt_policy_can_list_policies_without_deadlock() {
     let agent = Agent::builder()
         .provider(Mock::with_text("ok"))

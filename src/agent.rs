@@ -293,6 +293,7 @@ impl Agent {
                 .collect();
 
             if tool_calls.is_empty() || response.stop_reason == StopReason::EndTurn {
+                last_recent_tool_calls.clear();
                 let before_drain = new_messages.len();
                 drain_queued_user_messages(&mut control, &turn_id, &mut history, &mut new_messages);
                 if new_messages.len() > before_drain {
@@ -815,6 +816,7 @@ impl Agent {
             new_messages.push(assistant_msg);
 
             if tool_uses.is_empty() || resolved_stop == StopReason::EndTurn {
+                last_recent_tool_calls.clear();
                 let before_drain = new_messages.len();
                 drain_queued_user_messages(&mut control, &turn_id, &mut history, &mut new_messages);
                 if new_messages.len() > before_drain {
