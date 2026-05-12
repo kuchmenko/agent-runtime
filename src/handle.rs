@@ -216,6 +216,11 @@ impl AgentHandle {
             .remove(id)
     }
 
+    /// Install a runtime prompt policy for future provider requests.
+    ///
+    /// Policies append traceable system-prompt blocks without changing tool-dispatch authority.
+    /// `PolicyScope::NextTurn` removes itself after the next matching request; the other scopes
+    /// stay active for this handle until removed.
     pub fn install_prompt_policy(&self, policy: PromptPolicy) -> Result<PolicyId, PolicyError> {
         let id = self
             .inner
@@ -231,6 +236,7 @@ impl AgentHandle {
         Ok(id)
     }
 
+    /// Remove a previously installed runtime prompt policy.
     pub fn remove_prompt_policy(&self, id: PolicyId) -> Result<(), PolicyError> {
         self.inner
             .prompt_policies
@@ -245,6 +251,7 @@ impl AgentHandle {
         Ok(())
     }
 
+    /// List installed prompt policies sorted by precedence.
     pub fn list_prompt_policies(&self) -> Vec<(PolicyId, PolicyMetadata)> {
         self.inner
             .prompt_policies

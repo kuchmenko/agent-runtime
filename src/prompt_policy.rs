@@ -7,22 +7,30 @@
 
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 
 use crate::guard::AgentSnapshot;
 
+/// Opaque identifier for a runtime prompt policy installed on an [`crate::AgentHandle`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PolicyId(pub(crate) u64);
 
+/// Lifetime of an installed prompt policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyScope {
     /// Apply once to the next provider request whose trigger matches.
     NextTurn,
     /// Apply to every matching provider request until removed.
     EveryTurnUntilRemoved,
-    /// Apply for the lifetime of this [`crate::AgentHandle`].
+    /// Apply for the lifetime of this [`crate::AgentHandle`], unless removed explicitly.
     Persistent,
 }
 
+/// Predicate used by [`PolicyTrigger::OnIntentMatch`] to decide whether a policy applies.
+///
+/// The matcher receives the same lightweight [`AgentSnapshot`] shape used by continuation
+/// guards. It must be fast and side-effect-light: it runs while the agent is assembling the
+/// next provider request.
 pub trait IntentMatcher: Send + Sync {
     fn matches(&self, snapshot: &AgentSnapshot) -> bool;
 }
@@ -36,12 +44,17 @@ where
     }
 }
 
+/// Condition that decides whether an installed prompt policy is appended to a provider request.
 pub enum PolicyTrigger {
+    /// Apply whenever the policy scope allows it.
     Always,
+    /// Apply when the matcher returns true for the current agent snapshot.
     OnIntentMatch(Box<dyn IntentMatcher>),
 }
 
+/// Runtime system-prompt addendum installed through [`crate::AgentHandle::install_prompt_policy`].
 pub struct PromptPolicy {
+    /// Human-readable name included in the traceability marker added to the system prompt.
     pub name: String,
     pub scope: PolicyScope,
     pub content: String,
@@ -50,6 +63,7 @@ pub struct PromptPolicy {
     pub trigger: PolicyTrigger,
 }
 
+/// Public metadata returned by [`crate::AgentHandle::list_prompt_policies`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyMetadata {
     pub name: String,
@@ -58,6 +72,7 @@ pub struct PolicyMetadata {
     pub trigger: PolicyTriggerMetadata,
 }
 
+/// Serializable-ish trigger shape for policy listing; matchers are opaque user code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyTriggerMetadata {
     Always,
@@ -76,9 +91,19 @@ pub enum PolicyError {
     NotFound,
 }
 
+#[derive(Clone)]
+enum StoredTrigger {
+    Always,
+    OnIntentMatch(Arc<dyn IntentMatcher>),
+}
+
 struct PolicyEntry {
     id: PolicyId,
-    policy: PromptPolicy,
+    name: String,
+    scope: PolicyScope,
+    content: String,
+    precedence: u8,
+    trigger: StoredTrigger,
 }
 
 #[derive(Default)]
@@ -87,12 +112,32 @@ pub(crate) struct PromptPolicySet {
     policies: VecDeque<PolicyEntry>,
 }
 
+#[derive(Clone)]
+pub(crate) struct PromptPolicyCandidate {
+    id: PolicyId,
+    trigger: StoredTrigger,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AppliedPromptPolicy {
     pub id: PolicyId,
     pub name: String,
     pub content: String,
     pub precedence: u8,
+}
+
+impl PromptPolicyCandidate {
+    pub(crate) fn id(&self) -> PolicyId {
+        self.id
+    }
+
+    pub(crate) fn matches(&self, snapshot: &AgentSnapshot) -> bool {
+        std::panic::catch_unwind(AssertUnwindSafe(|| match &self.trigger {
+            StoredTrigger::Always => true,
+            StoredTrigger::OnIntentMatch(matcher) => matcher.matches(snapshot),
+        }))
+        .unwrap_or(false)
+    }
 }
 
 impl PromptPolicySet {
@@ -106,17 +151,30 @@ impl PromptPolicySet {
         if let Some(existing) = self
             .policies
             .iter()
-            .find(|entry| entry.policy.precedence == policy.precedence)
+            .find(|entry| entry.precedence == policy.precedence)
         {
             return Err(PolicyError::DuplicatePrecedence {
                 precedence: policy.precedence,
-                existing: existing.policy.name.clone(),
+                existing: existing.name.clone(),
             });
         }
 
+        let trigger = match policy.trigger {
+            PolicyTrigger::Always => StoredTrigger::Always,
+            PolicyTrigger::OnIntentMatch(matcher) => {
+                StoredTrigger::OnIntentMatch(Arc::from(matcher))
+            }
+        };
         let id = PolicyId(self.next_id);
         self.next_id += 1;
-        self.policies.push_back(PolicyEntry { id, policy });
+        self.policies.push_back(PolicyEntry {
+            id,
+            name: policy.name,
+            scope: policy.scope,
+            content: policy.content,
+            precedence: policy.precedence,
+            trigger,
+        });
         Ok(id)
     }
 
@@ -132,32 +190,38 @@ impl PromptPolicySet {
         let mut policies: Vec<_> = self
             .policies
             .iter()
-            .map(|entry| (entry.id, metadata(&entry.policy)))
+            .map(|entry| (entry.id, metadata(entry)))
             .collect();
         policies.sort_by_key(|(_, metadata)| metadata.precedence);
         policies
     }
 
-    pub(crate) fn apply(&mut self, snapshot: &AgentSnapshot) -> Vec<AppliedPromptPolicy> {
+    pub(crate) fn candidates(&self) -> Vec<PromptPolicyCandidate> {
+        self.policies
+            .iter()
+            .map(|entry| PromptPolicyCandidate {
+                id: entry.id,
+                trigger: entry.trigger.clone(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn apply_matches(&mut self, matched_ids: &[PolicyId]) -> Vec<AppliedPromptPolicy> {
         let mut applied = Vec::new();
         let mut idx = 0;
         while idx < self.policies.len() {
-            let is_match = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                matches_trigger(&self.policies[idx].policy.trigger, snapshot)
-            }))
-            .unwrap_or(false);
-
+            let is_match = matched_ids.contains(&self.policies[idx].id);
             if is_match {
                 let entry = &self.policies[idx];
                 applied.push(AppliedPromptPolicy {
                     id: entry.id,
-                    name: entry.policy.name.clone(),
-                    content: entry.policy.content.clone(),
-                    precedence: entry.policy.precedence,
+                    name: entry.name.clone(),
+                    content: entry.content.clone(),
+                    precedence: entry.precedence,
                 });
             }
 
-            if is_match && self.policies[idx].policy.scope == PolicyScope::NextTurn {
+            if is_match && self.policies[idx].scope == PolicyScope::NextTurn {
                 self.policies.remove(idx);
             } else {
                 idx += 1;
@@ -168,21 +232,14 @@ impl PromptPolicySet {
     }
 }
 
-fn metadata(policy: &PromptPolicy) -> PolicyMetadata {
+fn metadata(policy: &PolicyEntry) -> PolicyMetadata {
     PolicyMetadata {
         name: policy.name.clone(),
         scope: policy.scope,
         precedence: policy.precedence,
         trigger: match policy.trigger {
-            PolicyTrigger::Always => PolicyTriggerMetadata::Always,
-            PolicyTrigger::OnIntentMatch(_) => PolicyTriggerMetadata::IntentMatcher,
+            StoredTrigger::Always => PolicyTriggerMetadata::Always,
+            StoredTrigger::OnIntentMatch(_) => PolicyTriggerMetadata::IntentMatcher,
         },
-    }
-}
-
-fn matches_trigger(trigger: &PolicyTrigger, snapshot: &AgentSnapshot) -> bool {
-    match trigger {
-        PolicyTrigger::Always => true,
-        PolicyTrigger::OnIntentMatch(matcher) => matcher.matches(snapshot),
     }
 }

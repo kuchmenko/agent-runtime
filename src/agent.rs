@@ -211,6 +211,7 @@ impl Agent {
         let mut history = messages;
         let mut new_messages: Vec<Message> = Vec::new();
         let mut total_usage = Usage::default();
+        let mut last_recent_tool_calls: Vec<String> = Vec::new();
         // None until the first provider response lands. Using Option here
         // (rather than seeding with `EndTurn`) avoids a misleading
         // `partial.stop_reason: EndTurn` on first-turn provider failures.
@@ -230,8 +231,14 @@ impl Agent {
                 });
             }
 
-            let (system, _policy_event) =
-                system_for_turn(&self.system, &control, turn, &new_messages, &turn_id);
+            let (system, _policy_event) = system_for_turn(
+                &self.system,
+                &control,
+                turn,
+                &new_messages,
+                &last_recent_tool_calls,
+                &turn_id,
+            );
             let request = Request {
                 model: self.model.clone(),
                 system,
@@ -326,6 +333,7 @@ impl Agent {
             }
 
             let recent_tool_calls = describe_tool_calls(&tool_calls);
+            last_recent_tool_calls = recent_tool_calls.clone();
             debug!(count = tool_calls.len(), "executing tool batch");
             let results = self
                 .executor
@@ -489,6 +497,7 @@ impl Agent {
         let mut history = messages;
         let mut new_messages: Vec<Message> = Vec::new();
         let mut total_usage = Usage::default();
+        let mut last_recent_tool_calls: Vec<String> = Vec::new();
         let mut last_stop: Option<StopReason> = None;
 
         let tool_defs = self.tool_definitions();
@@ -540,8 +549,14 @@ impl Agent {
                 });
             }
 
-            let (system, policy_event) =
-                system_for_turn(&self.system, &control, turn, &new_messages, &turn_id);
+            let (system, policy_event) = system_for_turn(
+                &self.system,
+                &control,
+                turn,
+                &new_messages,
+                &last_recent_tool_calls,
+                &turn_id,
+            );
             emit_policy_event(
                 policy_event,
                 &events_tx,
@@ -877,6 +892,7 @@ impl Agent {
             debug!(count = tool_uses.len(), "executing tool batch (stream)");
             let calls = tool_uses;
             let recent_tool_calls = describe_tool_calls(&calls);
+            last_recent_tool_calls = recent_tool_calls.clone();
 
             // Emit one `ToolCallPending` per call before invoking the
             // executor. The consumer's UI uses this to render an
@@ -1039,6 +1055,7 @@ fn system_for_turn(
     control: &AgentControl,
     turn_count: usize,
     new_messages: &[Message],
+    recent_tool_calls: &[String],
     turn_id: &TurnId,
 ) -> (Option<Vec<SystemBlock>>, Option<StreamEvent>) {
     let mut system = base.clone().unwrap_or_default();
@@ -1055,14 +1072,25 @@ fn system_for_turn(
             .rev()
             .find(|message| message.role == Role::Assistant)
             .cloned(),
-        recent_tool_calls: Vec::new(),
+        recent_tool_calls: recent_tool_calls.to_vec(),
     };
+    let candidates = control
+        .handle_inner
+        .prompt_policies
+        .read()
+        .expect("prompt policy lock poisoned")
+        .candidates();
+    let matched_ids: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| candidate.matches(&snapshot))
+        .map(|candidate| candidate.id())
+        .collect();
     let applied = control
         .handle_inner
         .prompt_policies
         .write()
         .expect("prompt policy lock poisoned")
-        .apply(&snapshot);
+        .apply_matches(&matched_ids);
     let event = if applied.is_empty() {
         None
     } else {
