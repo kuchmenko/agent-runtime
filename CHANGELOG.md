@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0](https://github.com/kuchmenko/tkach/compare/tkach-v0.4.0...tkach-v0.5.0) (2026-05-12)
+
+### Added
+
+* **Steering handle:** `Agent::run_with_handle` and `Agent::stream_with_handle` return an `AgentHandle` so callers can steer an active run without rebuilding the agent loop.
+* **Queued user input:** `AgentHandle::queue_user_message` appends operator context at the next safe provider-call boundary.
+* **Interrupts:** `AgentHandle::interrupt` can cancel the session, active turn, or one in-flight tool while preserving partial results.
+* **Modes:** `AgentMode`, `PlanMode`, and `AcceptEditsMode` gate tool dispatch independently from approval handlers.
+* **User input bridge:** root agents can request structured operator input through `AgentHandle::ask_user`.
+* **Continuation guards:** callers can install bounded predicates that inject follow-up prompts or abort runaway loops.
+* **Runtime prompt policies:** callers can install scoped system-prompt addenda with `NextTurn`, `EveryTurnUntilRemoved`, or handle-lifetime `Persistent` scope.
+* **Steering events:** streams now expose turn, mode, guard, and prompt-policy lifecycle events for UI and tracing integrations.
+* **Sub-agent profiles:** `SubAgent` supports named specialised child-agent profiles and forwards full child stream events to `trace_hook`.
+* **Tool concurrency controls:** `AgentBuilder` exposes read/mutator class caps and per-tool concurrency opt-ins.
+
+### Fixed
+
+* Hardened steering boundaries around turn ids, queue draining, tool admission, mode changes, continuation guards, and prompt-policy matching.
+* Prevented mode and prompt-policy lock-ordering hazards, including reentrant prompt-policy matchers.
+* Cleared stale tool-call context before later text-only prompt-policy matches.
+* Preserved mode and policy events before stream completion.
+* Applied parent tool policy correctly when filtering child-agent tool definitions.
+
 ## [0.4.0](https://github.com/kuchmenko/tkach/compare/tkach-v0.3.0...tkach-v0.4.0) (2026-05-08)
 
 
