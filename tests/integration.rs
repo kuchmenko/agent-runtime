@@ -577,6 +577,9 @@ async fn smoke_anthropic_stream_roundtrip() {
             | StreamEvent::ModeChangeRequested { .. }
             | StreamEvent::ContinuationInjected { .. }
             | StreamEvent::GuardAborted { .. }
+            | StreamEvent::PolicyInstalled { .. }
+            | StreamEvent::PolicyRemoved { .. }
+            | StreamEvent::PolicyApplied { .. }
             | StreamEvent::ThinkingDelta { .. }
             | StreamEvent::ThinkingBlock { .. }
             | StreamEvent::ToolCallPending { .. } => {}

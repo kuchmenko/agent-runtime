@@ -284,6 +284,9 @@ impl LlmProvider for OpenAICodex {
                 | StreamEvent::ModeChangeRequested { .. }
                 | StreamEvent::ContinuationInjected { .. }
                 | StreamEvent::GuardAborted { .. }
+                | StreamEvent::PolicyInstalled { .. }
+                | StreamEvent::PolicyRemoved { .. }
+                | StreamEvent::PolicyApplied { .. }
                 | StreamEvent::ToolCallPending { .. } => {}
                 StreamEvent::MessageDelta { stop_reason: sr } => stop_reason = sr,
                 StreamEvent::Usage(u) => usage = u,

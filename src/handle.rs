@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::guard::{ContinuationGuard, GuardError, GuardId};
 use crate::mode::{AgentMode, ModeAuthority, ModeError};
+use crate::prompt_policy::{PolicyError, PolicyId, PolicyMetadata, PromptPolicy};
 use crate::steering::{
     AgentHandleInner, InterruptError, InterruptOutcome, InterruptTarget, IntoQueueContent,
     PendingModeChange, SteerCommand, SteerError, TurnId,
@@ -213,5 +214,49 @@ impl AgentHandle {
             .write()
             .expect("continuation guard lock poisoned")
             .remove(id)
+    }
+
+    /// Install a runtime prompt policy for future provider requests.
+    ///
+    /// Policies append traceable system-prompt blocks without changing tool-dispatch authority.
+    /// `PolicyScope::NextTurn` removes itself after the next matching request; the other scopes
+    /// stay active for this handle until removed.
+    pub fn install_prompt_policy(&self, policy: PromptPolicy) -> Result<PolicyId, PolicyError> {
+        let id = self
+            .inner
+            .prompt_policies
+            .write()
+            .expect("prompt policy lock poisoned")
+            .install(policy)?;
+        self.inner
+            .mode_events
+            .lock()
+            .expect("mode event lock poisoned")
+            .push_back(StreamEvent::PolicyInstalled { policy_id: id });
+        Ok(id)
+    }
+
+    /// Remove a previously installed runtime prompt policy.
+    pub fn remove_prompt_policy(&self, id: PolicyId) -> Result<(), PolicyError> {
+        self.inner
+            .prompt_policies
+            .write()
+            .expect("prompt policy lock poisoned")
+            .remove(id)?;
+        self.inner
+            .mode_events
+            .lock()
+            .expect("mode event lock poisoned")
+            .push_back(StreamEvent::PolicyRemoved { policy_id: id });
+        Ok(())
+    }
+
+    /// List installed prompt policies sorted by precedence.
+    pub fn list_prompt_policies(&self) -> Vec<(PolicyId, PolicyMetadata)> {
+        self.inner
+            .prompt_policies
+            .read()
+            .expect("prompt policy lock poisoned")
+            .list()
     }
 }

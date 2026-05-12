@@ -18,7 +18,7 @@ use crate::executor::{
     AllowAll, ConcurrencyConfig, ToolCall, ToolConcurrency, ToolExecutor, ToolPolicy, ToolRegistry,
 };
 use crate::guard::{AgentSnapshot, GuardEval, GuardTrigger};
-use crate::message::{CacheControl, Content, Message, StopReason, Usage};
+use crate::message::{CacheControl, Content, Message, Role, StopReason, Usage};
 use crate::provider::{LlmProvider, Request, SystemBlock, ThinkingConfig, ToolDefinition};
 use crate::steering::{self, ActiveTurn, AgentControl, SteerCommand, TurnId};
 use crate::stream::StreamEvent;
@@ -211,6 +211,7 @@ impl Agent {
         let mut history = messages;
         let mut new_messages: Vec<Message> = Vec::new();
         let mut total_usage = Usage::default();
+        let mut last_recent_tool_calls: Vec<String> = Vec::new();
         // None until the first provider response lands. Using Option here
         // (rather than seeding with `EndTurn`) avoids a misleading
         // `partial.stop_reason: EndTurn` on first-turn provider failures.
@@ -230,9 +231,17 @@ impl Agent {
                 });
             }
 
+            let (system, _policy_event) = system_for_turn(
+                &self.system,
+                &control,
+                turn,
+                &new_messages,
+                &last_recent_tool_calls,
+                &turn_id,
+            );
             let request = Request {
                 model: self.model.clone(),
-                system: system_with_mode(&self.system, &control),
+                system,
                 messages: history.clone(),
                 tools: tool_defs.clone(),
                 max_tokens: self.max_tokens,
@@ -284,6 +293,7 @@ impl Agent {
                 .collect();
 
             if tool_calls.is_empty() || response.stop_reason == StopReason::EndTurn {
+                last_recent_tool_calls.clear();
                 let before_drain = new_messages.len();
                 drain_queued_user_messages(&mut control, &turn_id, &mut history, &mut new_messages);
                 if new_messages.len() > before_drain {
@@ -324,6 +334,7 @@ impl Agent {
             }
 
             let recent_tool_calls = describe_tool_calls(&tool_calls);
+            last_recent_tool_calls = recent_tool_calls.clone();
             debug!(count = tool_calls.len(), "executing tool batch");
             let results = self
                 .executor
@@ -487,6 +498,7 @@ impl Agent {
         let mut history = messages;
         let mut new_messages: Vec<Message> = Vec::new();
         let mut total_usage = Usage::default();
+        let mut last_recent_tool_calls: Vec<String> = Vec::new();
         let mut last_stop: Option<StopReason> = None;
 
         let tool_defs = self.tool_definitions();
@@ -538,9 +550,26 @@ impl Agent {
                 });
             }
 
+            let (system, policy_event) = system_for_turn(
+                &self.system,
+                &control,
+                turn,
+                &new_messages,
+                &last_recent_tool_calls,
+                &turn_id,
+            );
+            emit_policy_event(
+                policy_event,
+                &events_tx,
+                &trace_hook,
+                &new_messages,
+                &total_usage,
+            )
+            .await?;
+
             let request = Request {
                 model: self.model.clone(),
-                system: system_with_mode(&self.system, &control),
+                system,
                 messages: history.clone(),
                 tools: tool_defs.clone(),
                 max_tokens: self.max_tokens,
@@ -765,6 +794,9 @@ impl Agent {
                     | StreamEvent::ModeChangeRequested { .. }
                     | StreamEvent::ContinuationInjected { .. }
                     | StreamEvent::GuardAborted { .. }
+                    | StreamEvent::PolicyInstalled { .. }
+                    | StreamEvent::PolicyRemoved { .. }
+                    | StreamEvent::PolicyApplied { .. }
                     | StreamEvent::ToolCallPending { .. } => {}
                 }
             }
@@ -784,6 +816,7 @@ impl Agent {
             new_messages.push(assistant_msg);
 
             if tool_uses.is_empty() || resolved_stop == StopReason::EndTurn {
+                last_recent_tool_calls.clear();
                 let before_drain = new_messages.len();
                 drain_queued_user_messages(&mut control, &turn_id, &mut history, &mut new_messages);
                 if new_messages.len() > before_drain {
@@ -861,6 +894,7 @@ impl Agent {
             debug!(count = tool_uses.len(), "executing tool batch (stream)");
             let calls = tool_uses;
             let recent_tool_calls = describe_tool_calls(&calls);
+            last_recent_tool_calls = recent_tool_calls.clone();
 
             // Emit one `ToolCallPending` per call before invoking the
             // executor. The consumer's UI uses this to render an
@@ -1018,17 +1052,68 @@ fn begin_turn(
     (turn_id, turn_cancel, mode_event)
 }
 
-fn system_with_mode(
+fn system_for_turn(
     base: &Option<Vec<SystemBlock>>,
     control: &AgentControl,
-) -> Option<Vec<SystemBlock>> {
-    let addendum = current_mode(control).system_prompt_addendum();
-    if addendum.is_empty() {
-        return base.clone();
-    }
+    turn_count: usize,
+    new_messages: &[Message],
+    recent_tool_calls: &[String],
+    turn_id: &TurnId,
+) -> (Option<Vec<SystemBlock>>, Option<StreamEvent>) {
     let mut system = base.clone().unwrap_or_default();
-    system.push(SystemBlock::text(addendum.into_owned()));
-    Some(system)
+
+    let addendum = current_mode(control).system_prompt_addendum();
+    if !addendum.is_empty() {
+        system.push(SystemBlock::text(addendum.into_owned()));
+    }
+
+    let snapshot = AgentSnapshot {
+        turn_count,
+        last_assistant_message: new_messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::Assistant)
+            .cloned(),
+        recent_tool_calls: recent_tool_calls.to_vec(),
+    };
+    let candidates = control
+        .handle_inner
+        .prompt_policies
+        .read()
+        .expect("prompt policy lock poisoned")
+        .candidates();
+    let matched_ids: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| candidate.matches(&snapshot))
+        .map(|candidate| candidate.id())
+        .collect();
+    let applied = control
+        .handle_inner
+        .prompt_policies
+        .write()
+        .expect("prompt policy lock poisoned")
+        .apply_matches(&matched_ids);
+    let event = if applied.is_empty() {
+        None
+    } else {
+        let ids = applied.iter().map(|policy| policy.id).collect();
+        for policy in applied {
+            system.push(SystemBlock::text(format!(
+                "<!-- runtime policy: {} -->\n{}",
+                policy.name, policy.content
+            )));
+        }
+        Some(StreamEvent::PolicyApplied {
+            turn_id: turn_id.clone(),
+            policy_ids: ids,
+        })
+    };
+
+    if system.is_empty() {
+        (None, event)
+    } else {
+        (Some(system), event)
+    }
 }
 
 fn current_mode(control: &AgentControl) -> Arc<dyn crate::mode::AgentMode> {
@@ -1039,6 +1124,27 @@ fn current_mode(control: &AgentControl) -> Arc<dyn crate::mode::AgentMode> {
             .read()
             .expect("agent mode lock poisoned"),
     )
+}
+
+async fn emit_policy_event(
+    event: Option<StreamEvent>,
+    events_tx: &mpsc::Sender<Result<StreamEvent, ProviderError>>,
+    trace_hook: &Option<TraceHook>,
+    new_messages: &[Message],
+    total_usage: &Usage,
+) -> Result<(), AgentError> {
+    let Some(event) = event else {
+        return Ok(());
+    };
+    if let Some(hook) = trace_hook {
+        emit_trace(hook, &event);
+    }
+    if events_tx.send(Ok(event)).await.is_err() {
+        return Err(AgentError::Cancelled {
+            partial: build_partial(new_messages, total_usage, StopReason::Cancelled, ""),
+        });
+    }
+    Ok(())
 }
 
 async fn emit_drained_mode_events(

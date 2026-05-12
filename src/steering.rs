@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::guard::GuardSet;
 use crate::message::Content;
 use crate::mode::{AgentMode, DefaultMode, ModeAuthority};
+use crate::prompt_policy::PromptPolicySet;
 use crate::stream::StreamEvent;
 use crate::user_input::UserInputBridge;
 
@@ -213,6 +214,7 @@ pub(crate) struct AgentHandleInner {
     pub(crate) is_root_thread: bool,
     pub(crate) user_input_bridge: Option<Arc<dyn UserInputBridge>>,
     pub(crate) guards: RwLock<GuardSet>,
+    pub(crate) prompt_policies: RwLock<PromptPolicySet>,
 }
 
 pub(crate) struct PendingModeChange {
@@ -245,6 +247,7 @@ pub(crate) fn control_pair(
         is_root_thread,
         user_input_bridge,
         guards: RwLock::new(GuardSet::default()),
+        prompt_policies: RwLock::new(PromptPolicySet::default()),
     });
     let control = AgentControl {
         handle_inner: Arc::clone(&inner),

@@ -39,6 +39,7 @@ pub mod message;
 pub mod mode;
 pub mod model;
 pub mod policy;
+pub mod prompt_policy;
 pub mod provider;
 pub mod providers;
 pub mod steering;
@@ -66,6 +67,10 @@ pub use mode::{
     AcceptEditsMode, AgentMode, DefaultMode, ModeAuthority, ModeDecision, ModeError, PlanMode,
 };
 pub use policy::{AllowList, IntersectPolicy};
+pub use prompt_policy::{
+    IntentMatcher, PolicyError, PolicyId, PolicyMetadata, PolicyScope, PolicyTrigger,
+    PolicyTriggerMetadata, PromptPolicy,
+};
 pub use provider::{
     LlmProvider, Request, Response, SystemBlock, ThinkingConfig, ThinkingEffort, ToolDefinition,
 };

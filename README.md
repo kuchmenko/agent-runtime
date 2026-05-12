@@ -345,9 +345,23 @@ while let Some(event) = stream.next().await {
 let result = stream.into_result().await?;
 ```
 
-Queued user messages are appended at the next provider-call boundary, never mid-tool. Tool interrupts cancel only that tool's child token; the agent feeds the cancellation result back to the model and continues the turn. The same handle also exposes mode gates (`PlanMode`, `AcceptEditsMode`, custom `AgentMode`), root-thread `ask_user(...)` via a caller-provided `UserInputBridge`, and synchronous `ContinuationGuard` predicates for keep-working loops.
+Queued user messages are appended at the next provider-call boundary, never mid-tool. Tool interrupts cancel only that tool's child token; the agent feeds the cancellation result back to the model and continues the turn. The same handle also exposes mode gates (`PlanMode`, `AcceptEditsMode`, custom `AgentMode`), root-thread `ask_user(...)` via a caller-provided `UserInputBridge`, synchronous `ContinuationGuard` predicates for keep-working loops, and runtime prompt policies.
 
-See [`examples/streaming_cancel.rs`](./examples/streaming_cancel.rs) for live cancel timing.
+Prompt policies append traceable system-prompt blocks at provider-call boundaries without changing tool-dispatch authority:
+
+```rust
+handle.install_prompt_policy(tkach::PromptPolicy {
+    name: "diagnose-first".into(),
+    scope: tkach::PolicyScope::NextTurn,
+    content: "Prefer diagnosis before code.".into(),
+    precedence: 10,
+    trigger: tkach::PolicyTrigger::Always,
+})?;
+```
+
+`PolicyScope::NextTurn` removes itself after the next matching provider request. `EveryTurnUntilRemoved` and `Persistent` stay installed for this handle until removed; `Persistent` does not cross process or handle lifetime boundaries. Streaming callers can observe `PolicyInstalled`, `PolicyRemoved`, and `PolicyApplied` events.
+
+See [`examples/streaming_cancel.rs`](./examples/streaming_cancel.rs) for live cancel timing and [`examples/steering_edge_cases.rs`](./examples/steering_edge_cases.rs) for deterministic steering boundary checks.
 
 ## Approval flow
 

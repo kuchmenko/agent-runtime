@@ -10,8 +10,8 @@ use tkach::provider::{LlmProvider, Request, Response};
 use tkach::providers::Mock;
 use tkach::stream::ProviderEventStream;
 use tkach::{
-    Agent, CancellationToken, InterruptOutcome, InterruptTarget, StreamEvent, Tool, ToolClass,
-    ToolContext, ToolError, ToolOutput, TurnId,
+    Agent, CancellationToken, InterruptOutcome, InterruptTarget, PolicyScope, PolicyTrigger,
+    PromptPolicy, StreamEvent, Tool, ToolClass, ToolContext, ToolError, ToolOutput, TurnId,
 };
 use tokio::sync::Notify;
 
@@ -119,6 +119,495 @@ async fn queued_user_message_drains_before_next_provider_request() {
             .iter()
             .any(|m| m.text() == "queued fact")
     );
+}
+
+#[tokio::test]
+async fn next_turn_prompt_policy_applies_once_to_next_provider_request() {
+    let started = Arc::new(Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = Arc::clone(&calls);
+
+    let mock = Mock::new(move |req| {
+        let n = calls_clone.fetch_add(1, Ordering::SeqCst);
+        match n {
+            0 => Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "slow-1".into(),
+                    name: "slow".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            }),
+            _ => {
+                let system = req
+                    .system
+                    .as_ref()
+                    .expect("policy should create system blocks");
+                assert!(
+                    system.iter().any(|block| block.text.contains(
+                        "<!-- runtime policy: stay-focused -->\nPrefer diagnosis before code."
+                    )),
+                    "runtime policy was not added to the system prompt: {system:?}"
+                );
+                Ok(Response {
+                    content: vec![Content::text("final")],
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage::default(),
+                })
+            }
+        }
+    });
+
+    let agent = Agent::builder()
+        .provider(mock)
+        .model("test")
+        .tool(SlowTool {
+            started: Arc::clone(&started),
+            delay: Duration::from_millis(50),
+        })
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let (future, handle) = agent.run_with_handle(prompt("start"), CancellationToken::new());
+    let task = tokio::spawn(future);
+
+    started.notified().await;
+    let id = handle
+        .install_prompt_policy(PromptPolicy {
+            name: "stay-focused".into(),
+            scope: PolicyScope::NextTurn,
+            content: "Prefer diagnosis before code.".into(),
+            precedence: 10,
+            trigger: PolicyTrigger::Always,
+        })
+        .unwrap();
+    assert_eq!(handle.list_prompt_policies().len(), 1);
+
+    let result = task.await.unwrap().unwrap();
+    assert_eq!(result.text, "final");
+    assert!(handle.list_prompt_policies().is_empty());
+    assert!(matches!(
+        handle.remove_prompt_policy(id),
+        Err(tkach::PolicyError::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn intent_match_prompt_policy_observes_recent_tool_calls() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = Arc::clone(&calls);
+    let mock = Mock::new(
+        move |req| match calls_clone.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                assert!(
+                    req.system.is_none(),
+                    "policy should not match before tool call"
+                );
+                Ok(Response {
+                    content: vec![Content::ToolUse {
+                        id: "slow-match".into(),
+                        name: "slow".into(),
+                        input: json!({}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: Usage::default(),
+                })
+            }
+            _ => {
+                let system = req.system.as_ref().expect("matched policy creates system");
+                assert!(
+                    system.iter().any(|block| block
+                        .text
+                        .contains("<!-- runtime policy: after-slow -->\nMention the slow tool.")),
+                    "tool-call intent policy was not added: {system:?}"
+                );
+                Ok(Response {
+                    content: vec![Content::text("final")],
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage::default(),
+                })
+            }
+        },
+    );
+
+    let agent = Agent::builder()
+        .provider(mock)
+        .model("test")
+        .tool(SlowTool {
+            started: Arc::new(Notify::new()),
+            delay: Duration::from_millis(1),
+        })
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let (future, handle) = agent.run_with_handle(prompt("start"), CancellationToken::new());
+    handle
+        .install_prompt_policy(PromptPolicy {
+            name: "after-slow".into(),
+            scope: PolicyScope::NextTurn,
+            content: "Mention the slow tool.".into(),
+            precedence: 10,
+            trigger: PolicyTrigger::OnIntentMatch(Box::new(|snapshot: &tkach::AgentSnapshot| {
+                snapshot
+                    .recent_tool_calls
+                    .iter()
+                    .any(|call| call == "slow:slow-match")
+            })),
+        })
+        .unwrap();
+
+    let result = future.await.unwrap();
+    assert_eq!(result.text, "final");
+}
+
+#[tokio::test]
+async fn intent_match_prompt_policy_clears_tool_context_after_text_turn() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = Arc::clone(&calls);
+    let mock = Mock::new(
+        move |req| match calls_clone.fetch_add(1, Ordering::SeqCst) {
+            0 => Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "slow-stale".into(),
+                    name: "slow".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            }),
+            1 => {
+                assert!(
+                    req.system
+                        .as_ref()
+                        .is_some_and(|system| system.iter().any(|block| block.text.contains(
+                            "<!-- runtime policy: after-slow -->\nMention the slow tool."
+                        ))),
+                    "policy should match immediately after the tool batch"
+                );
+                Ok(Response {
+                    content: vec![Content::text("not done")],
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage::default(),
+                })
+            }
+            _ => {
+                assert!(
+                    req.system.is_none(),
+                    "tool-call policy must not see stale tool context after a text-only turn: {:?}",
+                    req.system
+                );
+                Ok(Response {
+                    content: vec![Content::text("final")],
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage::default(),
+                })
+            }
+        },
+    );
+
+    let agent = Agent::builder()
+        .provider(mock)
+        .model("test")
+        .tool(SlowTool {
+            started: Arc::new(Notify::new()),
+            delay: Duration::from_millis(1),
+        })
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let (future, handle) = agent.run_with_handle(prompt("start"), CancellationToken::new());
+    handle
+        .install_prompt_policy(PromptPolicy {
+            name: "after-slow".into(),
+            scope: PolicyScope::EveryTurnUntilRemoved,
+            content: "Mention the slow tool.".into(),
+            precedence: 10,
+            trigger: PolicyTrigger::OnIntentMatch(Box::new(|snapshot: &tkach::AgentSnapshot| {
+                snapshot
+                    .recent_tool_calls
+                    .iter()
+                    .any(|call| call == "slow:slow-stale")
+            })),
+        })
+        .unwrap();
+    handle
+        .install_continuation_guard(tkach::ContinuationGuard {
+            name: "continue-after-text".into(),
+            trigger: tkach::GuardTrigger::OnTurnEnd,
+            predicate: Box::new(|snapshot| {
+                if snapshot
+                    .last_assistant_message
+                    .as_ref()
+                    .is_some_and(|message| message.text() == "not done")
+                {
+                    tkach::GuardDecision::Continue
+                } else {
+                    tkach::GuardDecision::Stop
+                }
+            }),
+            continuation_prompt: "continue".into(),
+            max_iterations: Some(1),
+            escape: tkach::GuardEscape::MaxIterations,
+        })
+        .unwrap();
+
+    let result = future.await.unwrap();
+    assert_eq!(result.text, "final");
+}
+
+#[tokio::test]
+async fn intent_match_prompt_policy_can_list_policies_without_deadlock() {
+    let agent = Agent::builder()
+        .provider(Mock::with_text("ok"))
+        .model("test")
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let (future, handle) = agent.run_with_handle(prompt("hi"), CancellationToken::new());
+    let handle_for_matcher = handle.clone();
+    handle
+        .install_prompt_policy(PromptPolicy {
+            name: "reentrant-list".into(),
+            scope: PolicyScope::NextTurn,
+            content: "Still apply.".into(),
+            precedence: 10,
+            trigger: PolicyTrigger::OnIntentMatch(Box::new(move |_: &tkach::AgentSnapshot| {
+                !handle_for_matcher.list_prompt_policies().is_empty()
+            })),
+        })
+        .unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(1), future)
+        .await
+        .expect("policy matcher deadlocked while listing policies")
+        .unwrap();
+    assert_eq!(result.text, "ok");
+}
+
+#[tokio::test]
+async fn every_turn_prompt_policy_applies_until_removed() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = Arc::clone(&calls);
+    let applications = Arc::new(AtomicUsize::new(0));
+    let applications_clone = Arc::clone(&applications);
+    let mock = Mock::new(move |req| {
+        let system = req.system.as_ref().expect("policy creates system");
+        if system.iter().any(|block| {
+            block
+                .text
+                .contains("<!-- runtime policy: every -->\nEvery request.")
+        }) {
+            applications_clone.fetch_add(1, Ordering::SeqCst);
+        }
+
+        match calls_clone.fetch_add(1, Ordering::SeqCst) {
+            0 | 1 => Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "slow-loop".into(),
+                    name: "slow".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            }),
+            _ => Ok(Response {
+                content: vec![Content::text("final")],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            }),
+        }
+    });
+
+    let agent = Agent::builder()
+        .provider(mock)
+        .model("test")
+        .tool(SlowTool {
+            started: Arc::new(Notify::new()),
+            delay: Duration::from_millis(1),
+        })
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let (future, handle) = agent.run_with_handle(prompt("start"), CancellationToken::new());
+    let id = handle
+        .install_prompt_policy(PromptPolicy {
+            name: "every".into(),
+            scope: PolicyScope::EveryTurnUntilRemoved,
+            content: "Every request.".into(),
+            precedence: 10,
+            trigger: PolicyTrigger::Always,
+        })
+        .unwrap();
+
+    let result = future.await.unwrap();
+    assert_eq!(result.text, "final");
+    assert_eq!(applications.load(Ordering::SeqCst), 3);
+    assert_eq!(handle.list_prompt_policies().len(), 1);
+    handle.remove_prompt_policy(id).unwrap();
+    assert!(handle.list_prompt_policies().is_empty());
+}
+
+#[tokio::test]
+async fn persistent_prompt_policy_is_handle_lifetime_until_removed() {
+    let agent = Agent::builder()
+        .provider(Mock::with_text("ok"))
+        .model("test")
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let (_future, handle) = agent.run_with_handle(prompt("hi"), CancellationToken::new());
+    let id = handle
+        .install_prompt_policy(PromptPolicy {
+            name: "persistent".into(),
+            scope: PolicyScope::Persistent,
+            content: "Persist for this handle.".into(),
+            precedence: 10,
+            trigger: PolicyTrigger::Always,
+        })
+        .unwrap();
+
+    let listed = handle.list_prompt_policies();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].1.scope, PolicyScope::Persistent);
+    handle.remove_prompt_policy(id).unwrap();
+    assert!(handle.list_prompt_policies().is_empty());
+}
+
+#[tokio::test]
+async fn streaming_prompt_policy_events_are_emitted() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = Arc::clone(&calls);
+    let mock = Mock::new(move |_| match calls_clone.fetch_add(1, Ordering::SeqCst) {
+        0 => Ok(Response {
+            content: vec![Content::ToolUse {
+                id: "slow-stream".into(),
+                name: "slow".into(),
+                input: json!({}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+        }),
+        _ => Ok(Response {
+            content: vec![Content::text("hello")],
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        }),
+    });
+    let agent = Agent::builder()
+        .provider(mock)
+        .model("test")
+        .tool(SlowTool {
+            started: Arc::new(Notify::new()),
+            delay: Duration::from_millis(25),
+        })
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+
+    let (mut stream, handle) = agent.stream_with_handle(prompt("hi"), CancellationToken::new());
+    while let Some(event) = stream.next().await {
+        if matches!(event.unwrap(), StreamEvent::ToolCallPending { .. }) {
+            break;
+        }
+    }
+
+    let removed_id = handle
+        .install_prompt_policy(PromptPolicy {
+            name: "remove-me".into(),
+            scope: PolicyScope::EveryTurnUntilRemoved,
+            content: "Remove me.".into(),
+            precedence: 1,
+            trigger: PolicyTrigger::Always,
+        })
+        .unwrap();
+    handle.remove_prompt_policy(removed_id).unwrap();
+    let applied_id = handle
+        .install_prompt_policy(PromptPolicy {
+            name: "apply-me".into(),
+            scope: PolicyScope::NextTurn,
+            content: "Apply me.".into(),
+            precedence: 2,
+            trigger: PolicyTrigger::Always,
+        })
+        .unwrap();
+
+    let mut next_turn = None;
+    let mut saw_installed_removed = false;
+    let mut saw_removed = false;
+    let mut saw_installed_applied = false;
+    let mut saw_applied = false;
+    while let Some(event) = stream.next().await {
+        match event.unwrap() {
+            StreamEvent::TurnStarted { turn_id } => next_turn = Some(turn_id),
+            StreamEvent::PolicyInstalled { policy_id } if policy_id == removed_id => {
+                saw_installed_removed = true;
+            }
+            StreamEvent::PolicyRemoved { policy_id } if policy_id == removed_id => {
+                saw_removed = true;
+            }
+            StreamEvent::PolicyInstalled { policy_id } if policy_id == applied_id => {
+                saw_installed_applied = true;
+            }
+            StreamEvent::PolicyApplied {
+                turn_id: applied_turn,
+                policy_ids,
+            } => {
+                saw_applied =
+                    next_turn.as_ref() == Some(&applied_turn) && policy_ids == vec![applied_id];
+            }
+            StreamEvent::ContentDelta(_) => break,
+            _ => {}
+        }
+    }
+
+    assert!(saw_installed_removed);
+    assert!(saw_removed);
+    assert!(saw_installed_applied);
+    assert!(saw_applied);
+    assert!(handle.list_prompt_policies().is_empty());
+    let result = stream.into_result().await.unwrap();
+    assert_eq!(result.text, "hello");
+}
+
+#[tokio::test]
+async fn prompt_policy_rejects_duplicate_precedence() {
+    let agent = Agent::builder()
+        .provider(Mock::with_text("ok"))
+        .model("test")
+        .working_dir(test_dir())
+        .build()
+        .unwrap();
+    let (_future, handle) = agent.run_with_handle(prompt("hi"), CancellationToken::new());
+
+    handle
+        .install_prompt_policy(PromptPolicy {
+            name: "first".into(),
+            scope: PolicyScope::EveryTurnUntilRemoved,
+            content: "first".into(),
+            precedence: 7,
+            trigger: PolicyTrigger::Always,
+        })
+        .unwrap();
+    let err = handle
+        .install_prompt_policy(PromptPolicy {
+            name: "second".into(),
+            scope: PolicyScope::EveryTurnUntilRemoved,
+            content: "second".into(),
+            precedence: 7,
+            trigger: PolicyTrigger::Always,
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        tkach::PolicyError::DuplicatePrecedence { precedence: 7, .. }
+    ));
 }
 
 #[tokio::test]
