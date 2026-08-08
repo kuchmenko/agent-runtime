@@ -313,6 +313,7 @@ async fn phase3_multi_block(provider: &Arc<Anthropic>) -> Result<(), Box<dyn std
                     Content::Thinking { .. } => "Thinking",
                     Content::ToolUse { .. } => "ToolUse",
                     Content::ToolResult { .. } => "ToolResult",
+                    Content::Image { .. } => "Image",
                 })
                 .collect();
             eprintln!("  block sequence        : {blocks:?}");

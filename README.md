@@ -51,6 +51,31 @@ async fn main() -> anyhow::Result<()> {
 
 > **New to tkach?** Run `cargo run --example basic` for a ~30-line working agent against Anthropic, or `cargo run --example streaming` for the streaming variant. Full list under [Examples](#examples) below.
 
+### Image input
+
+User messages can mix text and images in exact block order. Images may come from in-memory bytes, an absolute local file path, or a URL:
+
+```rust
+use tkach::{Content, Message};
+
+let first_capture = std::path::PathBuf::from("/absolute/path/first.png");
+let second_capture = std::path::PathBuf::from("/absolute/path/second.png");
+
+history.push(Message::user(vec![
+    Content::text("First region:"),
+    Content::image_file("image/png", first_capture),
+    Content::text("Second region:"),
+    Content::image_file("image/png", second_capture),
+    Content::text("Compare these regions."),
+]));
+
+let result = agent.run(history.clone(), CancellationToken::new()).await?;
+history.extend(result.new_messages);
+history.push(Message::user_text("Which region contains the setting?"));
+```
+
+Local image files are read asynchronously before each provider request and must use absolute paths. The caller owns those files and their lifecycle. Stateless replay resends and rereads every image retained in history on later turns. `Content::image_bytes` creates a self-contained history entry whose JSON uses base64; `Content::image_url` relies on the URL remaining available. Image input through the ChatGPT Codex subscription provider is experimental because that endpoint is undocumented.
+
 ## Architecture at a glance
 
 ```
@@ -494,8 +519,11 @@ Examples that talk to live APIs read `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and 
 ```sh
 cargo test                       # unit + mock-based integration (no network)
 cargo test -- --ignored          # adds real-API smoke tests (needs ANTHROPIC_API_KEY)
+cargo test --test integration image_input -- --ignored --test-threads=1 --nocapture
 cargo run --example streaming    # any of the runnable examples
 ```
+
+The image-input smoke tests use a generated two-color PNG and verify real multimodal interpretation across each configured provider. Anthropic additionally verifies an absolute file source followed by a text-only turn that replays the same image history. OpenAI-compatible, Responses, and Codex tests skip when their provider-specific credentials are absent; see [`.env.example`](./.env.example) for model and endpoint overrides.
 
 CI runs fmt, clippy (with cognitive-complexity gates), MSRV (1.86), and `cargo deny` on every PR. Real-API smoke runs are gated behind `Actions → Integration Tests → Run workflow → tier=smoke|full`.
 

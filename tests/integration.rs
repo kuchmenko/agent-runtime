@@ -7,10 +7,13 @@
 use std::path::Path;
 use std::sync::{Arc, Once};
 
+use base64::Engine;
 use futures::StreamExt;
 use tkach::message::{Content, Message, ThinkingProvider};
 use tkach::provider::{Request, SystemBlock};
-use tkach::providers::{Anthropic, OpenAICompatible, OpenAIResponses};
+use tkach::providers::{
+    Anthropic, CodexCredentials, OpenAICodex, OpenAICompatible, OpenAIResponses,
+};
 use tkach::tools::SubAgent;
 use tkach::{Agent, AgentResult, CancellationToken, LlmProvider, StreamEvent};
 
@@ -27,6 +30,58 @@ fn load_env() {
 
 fn prompt(text: &str) -> Vec<Message> {
     vec![Message::user_text(text)]
+}
+
+const IMAGE_INPUT_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAEAAAAAgCAIAAAAt/+nTAAAAOUlEQVR42u3PgQkAMAgEsdf9d26nUBByCxypl9kqs4fO8QAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2++LxAj88Ph5kAAAAAElFTkSuQmCC";
+
+fn image_input_bytes() -> Vec<u8> {
+    base64::engine::general_purpose::STANDARD
+        .decode(IMAGE_INPUT_PNG)
+        .unwrap()
+}
+
+fn image_input_request(model: String, messages: Vec<Message>) -> Request {
+    Request {
+        model,
+        system: Some(vec![SystemBlock::text(
+            "Follow the requested response format exactly.",
+        )]),
+        messages,
+        tools: vec![],
+        max_tokens: 128,
+        temperature: None,
+        thinking: None,
+    }
+}
+
+fn image_input_message(image: Content) -> Message {
+    Message::user(vec![
+        image,
+        Content::text(
+            "The image is split into two solid-color halves. Reply with exactly the two color names from left to right, separated by one space.",
+        ),
+    ])
+}
+
+fn response_text(content: &[Content]) -> String {
+    content
+        .iter()
+        .filter_map(|content| match content {
+            Content::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn assert_image_input_answer(text: &str) {
+    let answer = text.to_uppercase();
+    let red = answer
+        .find("RED")
+        .unwrap_or_else(|| panic!("expected RED in response: {text:?}"));
+    let blue = answer
+        .find("BLUE")
+        .unwrap_or_else(|| panic!("expected BLUE in response: {text:?}"));
+    assert!(red < blue, "expected RED before BLUE in response: {text:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +216,53 @@ async fn smoke_provider_roundtrip() {
     );
     assert!(result.usage.input_tokens > 0, "Should have input tokens");
     assert!(result.usage.output_tokens > 0, "Should have output tokens");
+}
+
+#[tokio::test]
+#[ignore]
+async fn smoke_anthropic_image_input_and_text_follow_up() {
+    load_env();
+    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+        Ok(key) if !key.is_empty() && !key.starts_with("sk-ant-...") => key,
+        _ => {
+            eprintln!(
+                "skipping smoke_anthropic_image_input_and_text_follow_up: ANTHROPIC_API_KEY missing"
+            );
+            return;
+        }
+    };
+    let provider = Anthropic::new(api_key);
+    let model = std::env::var("ANTHROPIC_IMAGE_MODEL")
+        .unwrap_or_else(|_| tkach::model::claude::HAIKU_20251001.to_string());
+    let dir = temp_dir("anthropic_image_input");
+    let image_path = dir.join("split-colors.png");
+    tokio::fs::write(&image_path, image_input_bytes())
+        .await
+        .unwrap();
+
+    let mut history = vec![image_input_message(Content::image_file(
+        "image/png",
+        &image_path,
+    ))];
+    let first = provider
+        .complete(image_input_request(model.clone(), history.clone()))
+        .await
+        .expect("Anthropic image input should succeed");
+    assert_image_input_answer(&response_text(&first.content));
+
+    history.push(Message::assistant(first.content));
+    history.push(Message::user_text(
+        "Reply with exactly the color on the left side of the image.",
+    ));
+    let follow_up = provider
+        .complete(image_input_request(model, history))
+        .await
+        .expect("Anthropic text follow-up should replay image history");
+    let follow_up_text = response_text(&follow_up.content).to_uppercase();
+    assert!(
+        follow_up_text.contains("RED"),
+        "expected RED in follow-up response: {follow_up_text:?}"
+    );
 }
 
 /// Agent reads a known file using the read tool.
@@ -521,6 +623,35 @@ async fn smoke_openai_compatible_roundtrip() {
     );
 }
 
+#[tokio::test]
+#[ignore]
+async fn smoke_openai_compatible_image_input() {
+    load_env();
+    let api_key = match std::env::var("OPENAI_API_KEY") {
+        Ok(key) if !key.is_empty() && !key.starts_with("sk-...") => key,
+        _ => {
+            eprintln!("skipping smoke_openai_compatible_image_input: OPENAI_API_KEY missing");
+            return;
+        }
+    };
+    let base_url = std::env::var("OPENAI_BASE_URL")
+        .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_string());
+    let model = std::env::var("OPENAI_IMAGE_MODEL")
+        .or_else(|_| std::env::var("OPENAI_SMOKE_MODEL"))
+        .unwrap_or_else(|_| tkach::model::openrouter::OPENAI_GPT_5_5.to_string());
+    let provider = OpenAICompatible::new(api_key).with_base_url(base_url);
+    let messages = vec![image_input_message(Content::image_bytes(
+        "image/png",
+        image_input_bytes(),
+    ))];
+
+    let response = provider
+        .complete(image_input_request(model, messages))
+        .await
+        .expect("OpenAI-compatible image input should succeed");
+    assert_image_input_answer(&response_text(&response.content));
+}
+
 // ---------------------------------------------------------------------------
 // Anthropic streaming smoke (real SSE round-trip)
 // ---------------------------------------------------------------------------
@@ -744,6 +875,69 @@ async fn smoke_openai_responses_thinking_stream() {
     assert!(got_done, "should have received Done terminal");
     assert!(thinking_blocks > 0, "should emit finalized thinking blocks");
     assert!(!text.trim().is_empty(), "should emit final visible text");
+}
+
+#[tokio::test]
+#[ignore]
+async fn smoke_openai_responses_image_input() {
+    load_env();
+    let api_key = match std::env::var("OPENAI_RESPONSES_API_KEY") {
+        Ok(key) if !key.is_empty() && !key.starts_with("sk-...") => key,
+        _ => {
+            eprintln!(
+                "skipping smoke_openai_responses_image_input: OPENAI_RESPONSES_API_KEY missing"
+            );
+            return;
+        }
+    };
+    let base_url = std::env::var("OPENAI_RESPONSES_BASE_URL")
+        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+    let model = std::env::var("OPENAI_RESPONSES_IMAGE_MODEL")
+        .or_else(|_| std::env::var("OPENAI_RESPONSES_MODEL"))
+        .unwrap_or_else(|_| tkach::model::gpt::FIVE.to_string());
+    let provider = OpenAIResponses::new(api_key).with_base_url(base_url);
+    let messages = vec![image_input_message(Content::image_bytes(
+        "image/png",
+        image_input_bytes(),
+    ))];
+
+    let response = provider
+        .complete(image_input_request(model, messages))
+        .await
+        .expect("OpenAI Responses image input should succeed");
+    assert_image_input_answer(&response_text(&response.content));
+}
+
+#[tokio::test]
+#[ignore]
+async fn smoke_openai_codex_image_input() {
+    load_env();
+    let access_token = std::env::var("OPENAI_CODEX_ACCESS_TOKEN").unwrap_or_default();
+    let account_id = std::env::var("OPENAI_CODEX_ACCOUNT_ID").unwrap_or_default();
+    if access_token.is_empty() || account_id.is_empty() {
+        eprintln!(
+            "skipping smoke_openai_codex_image_input: OPENAI_CODEX_ACCESS_TOKEN or OPENAI_CODEX_ACCOUNT_ID missing"
+        );
+        return;
+    }
+    let base_url = std::env::var("OPENAI_CODEX_BASE_URL")
+        .unwrap_or_else(|_| "https://chatgpt.com/backend-api".to_string());
+    let model = std::env::var("OPENAI_CODEX_IMAGE_MODEL")
+        .or_else(|_| std::env::var("OPENAI_CODEX_MODEL"))
+        .unwrap_or_else(|_| tkach::model::gpt::FIVE_CODEX.to_string());
+    let provider =
+        OpenAICodex::with_static_credentials(CodexCredentials::new(access_token, account_id))
+            .with_base_url(base_url);
+    let messages = vec![image_input_message(Content::image_bytes(
+        "image/png",
+        image_input_bytes(),
+    ))];
+
+    let response = provider
+        .complete(image_input_request(model, messages))
+        .await
+        .expect("OpenAI Codex image input should succeed");
+    assert_image_input_answer(&response_text(&response.content));
 }
 
 // ---------------------------------------------------------------------------

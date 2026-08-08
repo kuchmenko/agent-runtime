@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use base64::Engine;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -8,10 +9,10 @@ use serde_json::Value;
 
 use crate::error::ProviderError;
 use crate::message::{
-    CacheControl, Content, StopReason, ThinkingMetadata, ThinkingProvider, Usage,
+    CacheControl, Content, ImageSource, StopReason, ThinkingMetadata, ThinkingProvider, Usage,
 };
 use crate::provider::{
-    LlmProvider, Request, Response, SystemBlock, ThinkingConfig, ThinkingEffort,
+    LlmProvider, Request, Response, SystemBlock, ThinkingConfig, ThinkingEffort, resolve_request,
 };
 use crate::stream::{ProviderEventStream, StreamEvent};
 
@@ -191,6 +192,7 @@ impl Anthropic {
 #[async_trait]
 impl LlmProvider for Anthropic {
     async fn stream(&self, request: Request) -> Result<ProviderEventStream, ProviderError> {
+        let request = resolve_request(request).await?;
         let mut body = build_request_body_with_thinking(
             &request,
             effective_thinking(&request, self.thinking.as_ref()),
@@ -224,6 +226,7 @@ impl LlmProvider for Anthropic {
     }
 
     async fn complete(&self, request: Request) -> Result<Response, ProviderError> {
+        let request = resolve_request(request).await?;
         let body = build_request_body_with_thinking(
             &request,
             effective_thinking(&request, self.thinking.as_ref()),
@@ -691,6 +694,9 @@ pub(crate) enum ApiContent {
         cache_control: Option<CacheControl>,
     },
 
+    #[serde(rename = "image", skip_deserializing)]
+    Image { source: ApiImageSource },
+
     #[serde(rename = "thinking")]
     Thinking {
         thinking: String,
@@ -717,6 +723,15 @@ pub(crate) enum ApiContent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(tag = "type")]
+pub(crate) enum ApiImageSource {
+    #[serde(rename = "base64")]
+    Base64 { media_type: String, data: String },
+    #[serde(rename = "url")]
+    Url { url: String },
 }
 
 #[derive(Serialize)]
@@ -882,6 +897,16 @@ fn content_to_api(content: &Content) -> Option<ApiContent> {
             text: text.clone(),
             cache_control: cache_control.clone(),
         }),
+        Content::Image { source } => Some(ApiContent::Image {
+            source: match source {
+                ImageSource::Data { media_type, data } => ApiImageSource::Base64 {
+                    media_type: media_type.clone(),
+                    data: base64::engine::general_purpose::STANDARD.encode(data),
+                },
+                ImageSource::Url { url } => ApiImageSource::Url { url: url.clone() },
+                ImageSource::File { .. } => unreachable!("image files must be resolved"),
+            },
+        }),
         Content::Thinking {
             text,
             provider: ThinkingProvider::Anthropic,
@@ -927,6 +952,7 @@ pub(crate) fn convert_response(api: ApiResponse) -> Response {
                 text,
                 cache_control,
             },
+            ApiContent::Image { .. } => unreachable!("images are input-only"),
             ApiContent::Thinking {
                 thinking,
                 signature,
@@ -987,6 +1013,47 @@ mod tests {
         let req = req_with_system(blocks);
         let body = build_request_body(&req);
         serde_json::to_value(&body).unwrap()
+    }
+
+    #[test]
+    fn images_preserve_mixed_order_and_source_shape() {
+        let mut req = req_with_system(vec![]);
+        req.messages = vec![Message::user(vec![
+            Content::text("before"),
+            Content::image_bytes("image/png", bytes::Bytes::from_static(b"png")),
+            Content::image_url("https://example.test/image.jpg"),
+            Content::text("after"),
+        ])];
+        let value = serde_json::to_value(build_request_body(&req)).unwrap();
+        let content = value["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(
+            content[1]["source"],
+            json!({"type":"base64","media_type":"image/png","data":"cG5n"})
+        );
+        assert_eq!(
+            content[2]["source"],
+            json!({"type":"url","url":"https://example.test/image.jpg"})
+        );
+        assert_eq!(content[3]["type"], "text");
+    }
+
+    #[test]
+    fn image_response_block_is_rejected_during_deserialization() {
+        let raw = json!({
+            "content": [{
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "cG5n"
+                }
+            }],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+
+        assert!(serde_json::from_value::<ApiResponse>(raw).is_err());
     }
 
     #[test]

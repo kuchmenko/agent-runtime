@@ -1,3 +1,6 @@
+use std::path::PathBuf;
+
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -24,6 +27,9 @@ pub enum Content {
         cache_control: Option<CacheControl>,
     },
 
+    #[serde(rename = "image")]
+    Image { source: ImageSource },
+
     #[serde(rename = "thinking")]
     Thinking {
         text: String,
@@ -47,6 +53,47 @@ pub enum Content {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ImageSource {
+    Data {
+        media_type: String,
+        #[serde(with = "base64_bytes")]
+        data: Bytes,
+    },
+    File {
+        media_type: String,
+        path: PathBuf,
+    },
+    Url {
+        url: String,
+    },
+}
+
+mod base64_bytes {
+    use base64::Engine;
+    use bytes::Bytes;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(data: &Bytes, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(data))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Bytes, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map(Bytes::from)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// Provider that produced a persisted thinking/reasoning block.
@@ -302,6 +349,30 @@ impl Content {
         }
     }
 
+    pub fn image_bytes(media_type: impl Into<String>, data: impl Into<Bytes>) -> Self {
+        Content::Image {
+            source: ImageSource::Data {
+                media_type: media_type.into(),
+                data: data.into(),
+            },
+        }
+    }
+
+    pub fn image_file(media_type: impl Into<String>, absolute_path: impl Into<PathBuf>) -> Self {
+        Content::Image {
+            source: ImageSource::File {
+                media_type: media_type.into(),
+                path: absolute_path.into(),
+            },
+        }
+    }
+
+    pub fn image_url(url: impl Into<String>) -> Self {
+        Content::Image {
+            source: ImageSource::Url { url: url.into() },
+        }
+    }
+
     pub fn thinking(
         text: impl Into<String>,
         provider: ThinkingProvider,
@@ -339,6 +410,47 @@ impl Content {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_data_round_trips_as_base64() {
+        let value = Content::image_bytes("image/png", Bytes::from_static(b"png"));
+        let json = serde_json::to_value(&value).unwrap();
+        let round_trip: Content = serde_json::from_value(json.clone()).unwrap();
+
+        assert_eq!(json["source"]["data"], "cG5n");
+        assert!(json["source"]["data"].is_string());
+        assert!(matches!(
+            round_trip,
+            Content::Image {
+                source: ImageSource::Data { media_type, data }
+            } if media_type == "image/png" && data.as_ref() == b"png"
+        ));
+    }
+
+    #[test]
+    fn image_file_and_url_round_trip() {
+        let file = Content::image_file("image/jpeg", PathBuf::from("/tmp/image.jpg"));
+        let url = Content::image_url("https://example.test/image.webp");
+
+        let file_json = serde_json::to_value(&file).unwrap();
+        let url_json = serde_json::to_value(&url).unwrap();
+        let _: Content = serde_json::from_value(file_json).unwrap();
+        let _: Content = serde_json::from_value(url_json).unwrap();
+    }
+
+    #[test]
+    fn image_data_rejects_invalid_base64() {
+        let json = serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "data",
+                "media_type": "image/png",
+                "data": "not base64"
+            }
+        });
+
+        assert!(serde_json::from_value::<Content>(json).is_err());
+    }
 
     #[test]
     fn thinking_content_serializes_with_provider_metadata() {

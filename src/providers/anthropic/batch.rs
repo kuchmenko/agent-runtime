@@ -33,7 +33,7 @@ use super::{
     classify_error, convert_response, effective_thinking, parse_retry_after,
 };
 use crate::error::ProviderError;
-use crate::provider::{Request, Response};
+use crate::provider::{Request, Response, resolve_request};
 
 /// Pinned, boxed stream of batch results — ergonomic for callers that
 /// drive it with `.next().await` without needing to `Box::pin` themselves.
@@ -329,7 +329,15 @@ impl Anthropic {
     ) -> Result<BatchHandle, ProviderError> {
         validate_unique_and_well_formed(&requests)?;
 
-        let entries: Vec<RequestEntry<'_>> = requests
+        let mut resolved = Vec::with_capacity(requests.len());
+        for request in requests {
+            resolved.push(BatchRequest {
+                custom_id: request.custom_id,
+                params: resolve_request(request.params).await?,
+            });
+        }
+
+        let entries: Vec<RequestEntry<'_>> = resolved
             .iter()
             .map(|r| RequestEntry {
                 custom_id: &r.custom_id,

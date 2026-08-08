@@ -11,7 +11,7 @@
 use futures::StreamExt;
 use serde_json::json;
 use tkach::ProviderError;
-use tkach::message::Message;
+use tkach::message::{Content, Message};
 use tkach::provider::{Request, ThinkingConfig};
 use tkach::providers::Anthropic;
 use tkach::providers::anthropic::batch::{BatchOutcome, BatchRequest, BatchStatus};
@@ -86,6 +86,53 @@ async fn create_batch_posts_requests_and_parses_handle() {
     assert_eq!(handle.status, BatchStatus::InProgress);
     assert_eq!(handle.request_counts.processing, 2);
     assert!(!handle.is_terminal());
+}
+
+#[tokio::test]
+async fn create_batch_resolves_absolute_image_files() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/messages/batches"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(handle_json(
+            "msgbatch_01ABC",
+            "in_progress",
+            json!({"processing": 1, "succeeded": 0, "errored": 0, "canceled": 0, "expired": 0}),
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let image_path = std::env::temp_dir().join(format!(
+        "tkach-batch-image-{}-{}.png",
+        std::process::id(),
+        server.address().port()
+    ));
+    tokio::fs::write(&image_path, b"png").await.unwrap();
+
+    let mut request = req("req-1");
+    request.params.messages = vec![Message::user(vec![
+        Content::text("before"),
+        Content::image_file("image/png", &image_path),
+        Content::text("after"),
+    ])];
+    anthropic(&server)
+        .create_batch(vec![request])
+        .await
+        .expect("submit ok");
+    tokio::fs::remove_file(image_path).await.unwrap();
+
+    let received = &server.received_requests().await.unwrap()[0];
+    let body: serde_json::Value = serde_json::from_slice(&received.body).unwrap();
+    let content = body["requests"][0]["params"]["messages"][0]["content"]
+        .as_array()
+        .unwrap();
+    assert_eq!(content[0]["text"], "before");
+    assert_eq!(
+        content[1]["source"],
+        json!({"type":"base64","media_type":"image/png","data":"cG5n"})
+    );
+    assert_eq!(content[2]["text"], "after");
 }
 
 #[tokio::test]

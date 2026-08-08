@@ -31,10 +31,12 @@ impl AgentHandle {
         if content.is_empty() {
             return Err(SteerError::EmptyContent);
         }
-        if content
-            .iter()
-            .any(|content| !matches!(content, crate::Content::Text { .. }))
-        {
+        if content.iter().any(|content| {
+            !matches!(
+                content,
+                crate::Content::Text { .. } | crate::Content::Image { .. }
+            )
+        }) {
             return Err(SteerError::InvalidContent);
         }
 

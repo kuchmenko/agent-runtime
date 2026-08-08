@@ -199,11 +199,12 @@ impl OpenAICodex {
         format!("{}/codex/responses", self.base_url.trim_end_matches('/'))
     }
 
-    async fn send(&self, request: &Request) -> Result<reqwest::Response, ProviderError> {
+    async fn send(&self, request: Request) -> Result<reqwest::Response, ProviderError> {
+        let request = crate::provider::resolve_request(request).await?;
         let body = build_request_body(
-            request,
-            effective_reasoning_effort(request, self.reasoning_effort.as_ref()).as_ref(),
-            effective_reasoning_summary(request, self.reasoning_summary.as_ref()).as_ref(),
+            &request,
+            effective_reasoning_effort(&request, self.reasoning_effort.as_ref()).as_ref(),
+            effective_reasoning_summary(&request, self.reasoning_summary.as_ref()).as_ref(),
         );
         let credentials = self.credentials.credentials().await?;
 
@@ -242,7 +243,7 @@ impl fmt::Debug for OpenAICodex {
 #[async_trait]
 impl LlmProvider for OpenAICodex {
     async fn stream(&self, request: Request) -> Result<ProviderEventStream, ProviderError> {
-        let response = self.send(&request).await?;
+        let response = self.send(request).await?;
         Ok(Box::pin(proto::responses_event_stream(
             response.bytes_stream().eventsource(),
         )))
@@ -404,6 +405,27 @@ mod tests {
             temperature: Some(0.5),
             thinking: None,
         }
+    }
+
+    #[test]
+    fn body_maps_images_to_ordered_responses_parts() {
+        let mut request = sample_request();
+        request.messages = vec![Message::user(vec![
+            Content::text("before"),
+            Content::image_bytes("image/png", bytes::Bytes::from_static(b"png")),
+            Content::image_url("https://example.test/image.jpg"),
+        ])];
+        let body = build_request_body(&request, None, None);
+        let content = body["input"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0], json!({"type":"input_text","text":"before"}));
+        assert_eq!(
+            content[1],
+            json!({"type":"input_image","image_url":"data:image/png;base64,cG5n"})
+        );
+        assert_eq!(
+            content[2],
+            json!({"type":"input_image","image_url":"https://example.test/image.jpg"})
+        );
     }
 
     #[test]

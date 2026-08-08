@@ -1262,6 +1262,7 @@ name = "tkach"
 version = "0.5.0"
 dependencies = [
  "async-trait",
+ "base64",
  "bytes",
  "chrono",
  "dotenvy",
