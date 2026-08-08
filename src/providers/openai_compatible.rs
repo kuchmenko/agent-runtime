@@ -20,14 +20,15 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
+use base64::Engine;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::ProviderError;
-use crate::message::{Content, Message, Role, StopReason, Usage};
-use crate::provider::{LlmProvider, Request, Response};
+use crate::message::{Content, ImageSource, Message, Role, StopReason, Usage};
+use crate::provider::{LlmProvider, Request, Response, resolve_request};
 use crate::stream::{ProviderEventStream, StreamEvent};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -68,6 +69,7 @@ impl OpenAICompatible {
 #[async_trait]
 impl LlmProvider for OpenAICompatible {
     async fn stream(&self, request: Request) -> Result<ProviderEventStream, ProviderError> {
+        let request = resolve_request(request).await?;
         let mut body = build_request_body(&request);
         body.stream = true;
         body.stream_options = Some(StreamOptions {
@@ -98,6 +100,7 @@ impl LlmProvider for OpenAICompatible {
     }
 
     async fn complete(&self, request: Request) -> Result<Response, ProviderError> {
+        let request = resolve_request(request).await?;
         let body = build_request_body(&request);
         let url = format!("{}/chat/completions", self.base_url);
 
@@ -182,6 +185,10 @@ struct StreamOptions {
 enum ApiMessage {
     /// system / user — simple content string.
     Simple { role: &'static str, content: String },
+    Multipart {
+        role: &'static str,
+        content: Vec<ApiContentPart>,
+    },
     /// assistant — may have text content, tool_calls, or both.
     Assistant {
         role: &'static str,
@@ -196,6 +203,20 @@ enum ApiMessage {
         tool_call_id: String,
         content: String,
     },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type")]
+enum ApiContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ApiImageUrl },
+}
+
+#[derive(Serialize)]
+struct ApiImageUrl {
+    url: String,
 }
 
 #[derive(Serialize)]
@@ -331,58 +352,7 @@ fn build_request_body(request: &Request) -> ApiRequest {
 ///   `{role: assistant, content?, tool_calls?}`
 fn extend_with_message(out: &mut Vec<ApiMessage>, msg: &Message) {
     match msg.role {
-        Role::User => {
-            let mut text_buf = String::new();
-            for c in &msg.content {
-                match c {
-                    Content::Text { text, .. } => {
-                        if !text_buf.is_empty() {
-                            text_buf.push('\n');
-                        }
-                        text_buf.push_str(text);
-                    }
-                    Content::ToolResult {
-                        tool_use_id,
-                        content,
-                        is_error,
-                        ..
-                    } => {
-                        // Flush any pending user text before the tool results.
-                        if !text_buf.is_empty() {
-                            out.push(ApiMessage::Simple {
-                                role: "user",
-                                content: std::mem::take(&mut text_buf),
-                            });
-                        }
-                        // OpenAI's `role: "tool"` schema has no is_error field;
-                        // tools that returned errors would otherwise look
-                        // identical to successful results to the next turn.
-                        // Prefix the content with [error] so the model can
-                        // disambiguate. Anthropic-via-OpenRouter strips this
-                        // back out on its side; native OpenAI sees it inline.
-                        let wire_content = if *is_error {
-                            format!("[error] {content}")
-                        } else {
-                            content.clone()
-                        };
-                        out.push(ApiMessage::Tool {
-                            role: "tool",
-                            tool_call_id: tool_use_id.clone(),
-                            content: wire_content,
-                        });
-                    }
-                    Content::ToolUse { .. } | Content::Thinking { .. } => {
-                        // Should not appear in a user message; skip silently.
-                    }
-                }
-            }
-            if !text_buf.is_empty() {
-                out.push(ApiMessage::Simple {
-                    role: "user",
-                    content: text_buf,
-                });
-            }
-        }
+        Role::User => extend_with_user_message(out, msg),
         Role::Assistant => {
             let mut text_parts: Vec<String> = Vec::new();
             let mut tool_calls: Vec<ApiToolCallOut> = Vec::new();
@@ -401,7 +371,9 @@ fn extend_with_message(out: &mut Vec<ApiMessage>, msg: &Message) {
                             },
                         });
                     }
-                    Content::Thinking { .. } | Content::ToolResult { .. } => {
+                    Content::Thinking { .. }
+                    | Content::ToolResult { .. }
+                    | Content::Image { .. } => {
                         // Chat Completions has no standard assistant thinking block;
                         // provider-specific reasoning state is not replayable here.
                     }
@@ -426,6 +398,92 @@ fn extend_with_message(out: &mut Vec<ApiMessage>, msg: &Message) {
                 tool_calls,
             });
         }
+    }
+}
+
+fn extend_with_user_message(out: &mut Vec<ApiMessage>, msg: &Message) {
+    let mut parts = Vec::new();
+    let mut has_image = false;
+    for content in &msg.content {
+        match content {
+            Content::Text { text, .. } => parts.push(ApiContentPart::Text { text: text.clone() }),
+            Content::Image { source } => {
+                has_image = true;
+                parts.push(ApiContentPart::ImageUrl {
+                    image_url: ApiImageUrl {
+                        url: image_url(source),
+                    },
+                });
+            }
+            Content::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } => {
+                flush_user_parts(out, &mut parts, &mut has_image);
+                let wire_content = if *is_error {
+                    format!("[error] {content}")
+                } else {
+                    content.clone()
+                };
+                out.push(ApiMessage::Tool {
+                    role: "tool",
+                    tool_call_id: tool_use_id.clone(),
+                    content: wire_content,
+                });
+            }
+            Content::ToolUse { .. } | Content::Thinking { .. } => {}
+        }
+    }
+    flush_user_parts(out, &mut parts, &mut has_image);
+}
+
+fn flush_user_parts(
+    out: &mut Vec<ApiMessage>,
+    parts: &mut Vec<ApiContentPart>,
+    has_image: &mut bool,
+) {
+    if parts.is_empty() {
+        return;
+    }
+    let content = std::mem::take(parts);
+    if *has_image {
+        out.push(ApiMessage::Multipart {
+            role: "user",
+            content,
+        });
+    } else {
+        let mut text_buf = String::new();
+        for part in content {
+            match part {
+                ApiContentPart::Text { text } => {
+                    if !text_buf.is_empty() {
+                        text_buf.push('\n');
+                    }
+                    text_buf.push_str(&text);
+                }
+                ApiContentPart::ImageUrl { .. } => unreachable!(),
+            }
+        }
+        if !text_buf.is_empty() {
+            out.push(ApiMessage::Simple {
+                role: "user",
+                content: text_buf,
+            });
+        }
+    }
+    *has_image = false;
+}
+
+fn image_url(source: &ImageSource) -> String {
+    match source {
+        ImageSource::Data { media_type, data } => format!(
+            "data:{media_type};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(data)
+        ),
+        ImageSource::Url { url } => url.clone(),
+        ImageSource::File { .. } => unreachable!("image files must be resolved"),
     }
 }
 
@@ -747,6 +805,90 @@ mod tests {
     use super::*;
     use crate::message::CacheControl;
     use crate::provider::SystemBlock;
+
+    #[test]
+    fn mixed_images_use_ordered_multipart_while_text_only_stays_string() {
+        let mut req = Request {
+            model: "gpt-4".into(),
+            system: None,
+            messages: vec![Message::user_text("plain")],
+            tools: vec![],
+            max_tokens: 100,
+            temperature: None,
+            thinking: None,
+        };
+        let plain = serde_json::to_value(build_request_body(&req)).unwrap();
+        assert_eq!(plain["messages"][0]["content"], "plain");
+
+        req.messages = vec![Message::user(vec![
+            Content::text("before"),
+            Content::image_bytes("image/png", bytes::Bytes::from_static(b"png")),
+            Content::image_url("https://example.test/image.jpg"),
+            Content::text("after"),
+        ])];
+        let mixed = serde_json::to_value(build_request_body(&req)).unwrap();
+        let content = mixed["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            content[0],
+            serde_json::json!({"type":"text","text":"before"})
+        );
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,cG5n");
+        assert_eq!(
+            content[2]["image_url"]["url"],
+            "https://example.test/image.jpg"
+        );
+        assert_eq!(
+            content[3],
+            serde_json::json!({"type":"text","text":"after"})
+        );
+    }
+
+    #[test]
+    fn empty_text_blocks_keep_legacy_text_only_serialization() {
+        let req = Request {
+            model: "gpt-4".into(),
+            system: None,
+            messages: vec![
+                Message::user(vec![Content::text("")]),
+                Message::user(vec![Content::text(""), Content::text("visible")]),
+            ],
+            tools: vec![],
+            max_tokens: 100,
+            temperature: None,
+            thinking: None,
+        };
+
+        let body = serde_json::to_value(build_request_body(&req)).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"], "visible");
+    }
+
+    #[test]
+    fn multimodal_segments_flush_around_tool_results() {
+        let req = Request {
+            model: "gpt-4".into(),
+            system: None,
+            messages: vec![Message::user(vec![
+                Content::text("before"),
+                Content::image_url("https://example.test/image.png"),
+                Content::tool_result("call_1", "result", false),
+                Content::text("after"),
+            ])],
+            tools: vec![],
+            max_tokens: 100,
+            temperature: None,
+            thinking: None,
+        };
+
+        let body = serde_json::to_value(build_request_body(&req)).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert!(messages[0]["content"].is_array());
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call_1");
+        assert_eq!(messages[2]["content"], "after");
+    }
 
     #[test]
     fn request_maps_system_and_user_text() {

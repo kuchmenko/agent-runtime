@@ -74,14 +74,18 @@ async fn queued_user_message_drains_before_next_provider_request() {
                 usage: Usage::default(),
             }),
             _ => {
-                let saw_queued = req
+                let queued = req
                     .messages
                     .iter()
-                    .any(|m| m.text().contains("queued fact"));
-                assert!(
-                    saw_queued,
-                    "queued steering message was not sent to provider"
-                );
+                    .find(|message| message.text().contains("queued fact"))
+                    .expect("queued steering message was not sent to provider");
+                assert_eq!(queued.content.len(), 3);
+                assert!(matches!(
+                    &queued.content[1],
+                    Content::Image {
+                        source: tkach::ImageSource::Url { url }
+                    } if url == "https://example.test/capture.png"
+                ));
                 Ok(Response {
                     content: vec![Content::text("final")],
                     stop_reason: StopReason::EndTurn,
@@ -107,7 +111,14 @@ async fn queued_user_message_drains_before_next_provider_request() {
 
     started.notified().await;
     let turn_id = handle
-        .queue_user_message("queued fact", handle.current_turn_id())
+        .queue_user_message(
+            vec![
+                Content::text("queued fact"),
+                Content::image_url("https://example.test/capture.png"),
+                Content::text("after image"),
+            ],
+            handle.current_turn_id(),
+        )
         .unwrap();
     assert_eq!(Some(turn_id), handle.current_turn_id());
 
@@ -117,7 +128,12 @@ async fn queued_user_message_drains_before_next_provider_request() {
         result
             .new_messages
             .iter()
-            .any(|m| m.text() == "queued fact")
+            .any(|message| message.content.iter().any(|content| matches!(
+                content,
+                Content::Image {
+                    source: tkach::ImageSource::Url { .. }
+                }
+            )))
     );
 }
 

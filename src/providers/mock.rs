@@ -156,6 +156,7 @@ fn response_to_events(response: Response) -> Vec<StreamEvent> {
             Content::ToolResult { .. } => {
                 // ToolResult doesn't appear in assistant output; skip.
             }
+            Content::Image { .. } => {}
         }
     }
     events.push(StreamEvent::MessageDelta {

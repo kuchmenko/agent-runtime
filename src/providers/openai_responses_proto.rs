@@ -21,11 +21,12 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use base64::Engine;
 use serde_json::{Value, json};
 
 use crate::error::ProviderError;
 use crate::message::{
-    Content, Message, Role, StopReason, ThinkingMetadata, ThinkingProvider, Usage,
+    Content, ImageSource, Message, Role, StopReason, ThinkingMetadata, ThinkingProvider, Usage,
 };
 use crate::provider::{Request, Response, ToolDefinition};
 use crate::stream::StreamEvent;
@@ -167,19 +168,25 @@ pub(super) fn build_input(messages: &[Message]) -> Vec<Value> {
 }
 
 fn push_user_message(input: &mut Vec<Value>, message: &Message) {
-    let mut text = Vec::new();
+    let mut parts = Vec::new();
 
     for content in &message.content {
         match content {
-            Content::Text { text: chunk, .. } => text.push(chunk.as_str()),
+            Content::Text { text, .. } => parts.push(json!({
+                "type": "input_text",
+                "text": text,
+            })),
+            Content::Image { source } => parts.push(json!({
+                "type": "input_image",
+                "image_url": image_url(source),
+            })),
             Content::ToolResult {
                 tool_use_id,
                 content,
                 is_error,
                 ..
             } => {
-                push_text_message(input, "user", &text.join("\n"));
-                text.clear();
+                push_user_parts(input, &mut parts);
 
                 let output = if *is_error {
                     format!("[error] {content}")
@@ -196,7 +203,27 @@ fn push_user_message(input: &mut Vec<Value>, message: &Message) {
         }
     }
 
-    push_text_message(input, "user", &text.join("\n"));
+    push_user_parts(input, &mut parts);
+}
+
+fn push_user_parts(input: &mut Vec<Value>, parts: &mut Vec<Value>) {
+    if !parts.is_empty() {
+        input.push(json!({
+            "role": "user",
+            "content": std::mem::take(parts),
+        }));
+    }
+}
+
+fn image_url(source: &ImageSource) -> String {
+    match source {
+        ImageSource::Data { media_type, data } => format!(
+            "data:{media_type};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(data)
+        ),
+        ImageSource::Url { url } => url.clone(),
+        ImageSource::File { .. } => unreachable!("image files must be resolved"),
+    }
 }
 
 fn push_assistant_message(input: &mut Vec<Value>, message: &Message) {
@@ -246,7 +273,7 @@ fn push_assistant_message(input: &mut Vec<Value>, message: &Message) {
                 }
                 input.push(item);
             }
-            Content::Thinking { .. } | Content::ToolResult { .. } => {}
+            Content::Thinking { .. } | Content::ToolResult { .. } | Content::Image { .. } => {}
         }
     }
 

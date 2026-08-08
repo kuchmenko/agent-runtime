@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::error::ProviderError;
-use crate::message::{CacheControl, Content, Message, StopReason, Usage};
+use crate::message::{CacheControl, Content, ImageSource, Message, Role, StopReason, Usage};
 use crate::stream::ProviderEventStream;
 
 /// Definition of a tool that gets sent to the LLM.
@@ -74,6 +74,41 @@ pub struct Request {
     /// Optional per-call thinking/reasoning override. When set, providers
     /// that support thinking use it instead of their instance default.
     pub thinking: Option<ThinkingConfig>,
+}
+
+pub(crate) async fn resolve_request(mut request: Request) -> Result<Request, ProviderError> {
+    for message in &mut request.messages {
+        for content in &mut message.content {
+            if let Content::Image { source } = content {
+                if message.role != Role::User {
+                    return Err(ProviderError::InvalidLocalInput {
+                        message: "images are only valid in user messages".into(),
+                    });
+                }
+                if let ImageSource::File { media_type, path } = source {
+                    if !path.is_absolute() {
+                        return Err(ProviderError::InvalidLocalInput {
+                            message: format!(
+                                "image file path must be absolute: {}",
+                                path.display()
+                            ),
+                        });
+                    }
+                    let data = tokio::fs::read(&path).await.map_err(|source| {
+                        ProviderError::ImageFileRead {
+                            path: path.clone(),
+                            source,
+                        }
+                    })?;
+                    *source = ImageSource::Data {
+                        media_type: std::mem::take(media_type),
+                        data: data.into(),
+                    };
+                }
+            }
+        }
+    }
+    Ok(request)
 }
 
 /// Per-call thinking/reasoning configuration carried on [`Request`].
@@ -154,4 +189,75 @@ pub trait LlmProvider: Send + Sync {
     async fn complete(&self, request: Request) -> Result<Response, ProviderError>;
 
     async fn stream(&self, request: Request) -> Result<ProviderEventStream, ProviderError>;
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn request(content: Content, role: Role) -> Request {
+        Request {
+            model: "test".into(),
+            system: None,
+            messages: vec![Message {
+                role,
+                content: vec![content],
+            }],
+            tools: vec![],
+            max_tokens: 1,
+            temperature: None,
+            thinking: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolves_absolute_image_file_to_exact_bytes() {
+        let path = std::env::temp_dir().join(format!("tkach-image-{}", std::process::id()));
+        tokio::fs::write(&path, b"image bytes").await.unwrap();
+        let resolved =
+            resolve_request(request(Content::image_file("image/png", &path), Role::User))
+                .await
+                .unwrap();
+        tokio::fs::remove_file(path).await.unwrap();
+
+        assert!(matches!(
+            &resolved.messages[0].content[0],
+            Content::Image { source: ImageSource::Data { media_type, data } }
+                if media_type == "image/png" && data.as_ref() == b"image bytes"
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_relative_file_and_assistant_image_without_retry() {
+        let relative = resolve_request(request(
+            Content::image_file("image/png", PathBuf::from("image.png")),
+            Role::User,
+        ))
+        .await
+        .unwrap_err();
+        assert!(matches!(relative, ProviderError::InvalidLocalInput { .. }));
+        assert!(!relative.is_retryable());
+
+        let assistant = resolve_request(request(
+            Content::image_url("https://example.test/image.png"),
+            Role::Assistant,
+        ))
+        .await
+        .unwrap_err();
+        assert!(matches!(assistant, ProviderError::InvalidLocalInput { .. }));
+        assert!(!assistant.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn missing_image_file_error_carries_path() {
+        let path = std::env::temp_dir().join("tkach-missing-image-does-not-exist");
+        let error = resolve_request(request(Content::image_file("image/png", &path), Role::User))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ProviderError::ImageFileRead { path: ref actual, .. } if actual == &path)
+        );
+        assert!(!error.is_retryable());
+    }
 }

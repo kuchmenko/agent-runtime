@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -80,6 +81,16 @@ impl AgentError {
 /// to drive retry/backoff logic.
 #[derive(Debug, Error)]
 pub enum ProviderError {
+    #[error("invalid local request content: {message}")]
+    InvalidLocalInput { message: String },
+
+    #[error("failed to read image file {path}: {source}")]
+    ImageFileRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     /// Transport-layer failure (connection refused, timeout, DNS, etc.).
     /// Retryable by default — the request likely never landed on the server.
     #[error("HTTP error: {0}")]
@@ -140,7 +151,9 @@ impl ProviderError {
             ProviderError::Overloaded { .. } | ProviderError::RateLimit { .. } => true,
             ProviderError::Deserialization(_)
             | ProviderError::Other(_)
-            | ProviderError::BatchNotReady { .. } => false,
+            | ProviderError::BatchNotReady { .. }
+            | ProviderError::InvalidLocalInput { .. }
+            | ProviderError::ImageFileRead { .. } => false,
         }
     }
 

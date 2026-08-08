@@ -14,7 +14,9 @@ use serde_json::{Value, json};
 
 use super::openai_responses_proto::{self as proto, OpenAIEffort, OpenAISummary};
 use crate::error::ProviderError;
-use crate::provider::{LlmProvider, Request, Response, ThinkingConfig, ThinkingEffort};
+use crate::provider::{
+    LlmProvider, Request, Response, ThinkingConfig, ThinkingEffort, resolve_request,
+};
 use crate::stream::ProviderEventStream;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -104,6 +106,7 @@ impl OpenAIResponses {
 #[async_trait]
 impl LlmProvider for OpenAIResponses {
     async fn stream(&self, request: Request) -> Result<ProviderEventStream, ProviderError> {
+        let request = resolve_request(request).await?;
         let mut body = build_request_body(
             &request,
             effective_reasoning(&request, self.reasoning.as_ref()).as_ref(),
@@ -134,6 +137,7 @@ impl LlmProvider for OpenAIResponses {
     }
 
     async fn complete(&self, request: Request) -> Result<Response, ProviderError> {
+        let request = resolve_request(request).await?;
         let body = build_request_body(
             &request,
             effective_reasoning(&request, self.reasoning.as_ref()).as_ref(),

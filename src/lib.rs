@@ -60,8 +60,8 @@ pub use guard::{
 };
 pub use handle::AgentHandle;
 pub use message::{
-    CacheControl, CacheTtl, Content, Message, Role, StopReason, ThinkingMetadata, ThinkingProvider,
-    Usage,
+    CacheControl, CacheTtl, Content, ImageSource, Message, Role, StopReason, ThinkingMetadata,
+    ThinkingProvider, Usage,
 };
 pub use mode::{
     AcceptEditsMode, AgentMode, DefaultMode, ModeAuthority, ModeDecision, ModeError, PlanMode,
