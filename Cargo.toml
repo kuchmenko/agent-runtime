@@ -6,8 +6,8 @@ rust-version = "1.86.0"
 description = "Provider-independent Rust agent runtime — streaming, reasoning summaries, prompt caching, and per-call approval gating."
 license = "MIT"
 repository = "https://github.com/kuchmenko/tkach"
-documentation = "https://docs.rs/tkach"
 readme = "README.md"
+publish = false
 keywords = ["agent", "ai", "llm", "anthropic", "openai"]
 categories = ["api-bindings", "asynchronous"]
 

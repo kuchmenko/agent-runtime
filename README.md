@@ -2,8 +2,6 @@
 
 A provider-independent agent runtime for Rust. Stateless agent loop, pluggable LLM providers (Anthropic, OpenAI Responses, ChatGPT Codex, OpenAI-compatible), built-in file/shell tools, real SSE streaming with reasoning summaries, cooperative cancellation, and per-call approval gating.
 
-[![Crates.io](https://img.shields.io/crates/v/tkach.svg)](https://crates.io/crates/tkach)
-[![Docs.rs](https://img.shields.io/docsrs/tkach)](https://docs.rs/tkach)
 [![CI](https://github.com/kuchmenko/tkach/actions/workflows/ci.yml/badge.svg)](https://github.com/kuchmenko/tkach/actions/workflows/ci.yml)
 [![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -20,7 +18,7 @@ A provider-independent agent runtime for Rust. Stateless agent loop, pluggable L
 
 ```toml
 [dependencies]
-tkach = "0.6"
+tkach = { git = "https://github.com/kuchmenko/tkach" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -569,9 +567,9 @@ cargo run --example streaming    # any of the runnable examples
 The image-input smoke tests use a generated two-color PNG and verify real multimodal interpretation across each configured provider. Anthropic additionally verifies an absolute file source followed by a text-only turn that replays the same image history. OpenAI-compatible, Responses, and Codex tests skip when their provider-specific credentials are absent; see [`.env.example`](./.env.example) for model and endpoint overrides.
 
 CI runs formatting, clippy, all-target tests with coverage, RustSec audit,
-`cargo deny`, an MSRV 1.86 check, and `cargo publish --dry-run`. Clippy warnings
-other than `cognitive_complexity` and `too_many_lines` fail the build; those two
-are reported through SARIF without gating CI. Real-API tests run only through
+`cargo deny`, and an MSRV 1.86 check. Clippy warnings other than
+`cognitive_complexity` and `too_many_lines` fail the build; those two are
+reported through SARIF without gating CI. Real-API tests run only through
 `Actions → Integration Tests → Run workflow → tier=smoke|full`.
 
 ## Versioning & releases

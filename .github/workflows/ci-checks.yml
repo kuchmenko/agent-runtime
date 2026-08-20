@@ -1,12 +1,5 @@
 name: CI Checks
 
-# Reusable workflow. Called by:
-#   - ci.yml          on push/PR
-#   - release.yml     as a publish gate when release-please cuts a release
-#
-# Keep all check jobs (fmt, clippy, test, audit, deny, msrv, package) in this
-# file so PR-time CI and release-time CI run the exact same suite.
-
 on:
   workflow_call:
 
@@ -165,15 +158,3 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.86.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check
-
-  package:
-    name: Package (cargo publish --dry-run)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # Catches packaging issues (manifest, file inclusion, doc-test fail)
-      # before merge — so release.yml's real `cargo publish` doesn't fail
-      # after release-please has already cut a tag.
-      - run: cargo publish --dry-run

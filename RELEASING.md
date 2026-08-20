@@ -24,7 +24,7 @@ covers everything else — features, fixes, internals.
 ## How releases work
 
 This project uses [release-please](https://github.com/googleapis/release-please)
-for automated releases and `cargo publish` for distribution to crates.io.
+for automated GitHub releases.
 
 ### Commit conventions
 
@@ -48,59 +48,6 @@ refactor / test / perf             → no release
    - Updated `CHANGELOG.md`.
 3. **Merge the Release PR** when meaningful changes have accumulated.
 4. release-please cuts a GitHub Release + git tag from the merged commit.
-5. The Release workflow re-runs the full CI suite against the tagged
-   commit, then `cargo publish` ships the new version to crates.io.
 
-Steps 4 and 5 are automatic. There is no manual `cargo publish` step.
-
-### crates.io credential
-
-The `publish` job in `.github/workflows/release.yml` needs a crates.io
-API token in repo secret `CARGO_REGISTRY_TOKEN`.
-
-- Create the token at https://crates.io/settings/tokens with:
-  - **Scope:** `publish-update` only (no `publish-new` — the crate already exists).
-  - **Crate scope:** `tkach` (limit to this crate).
-  - **Expiry:** 1 year is reasonable.
-- Store it: `gh secret set CARGO_REGISTRY_TOKEN -R kuchmenko/tkach -b "<token>"`,
-  or via the GitHub UI: Settings → Secrets and variables → Actions →
-  New repository secret.
-
-### Why `cargo publish --dry-run` runs on every PR
-
-`ci-checks.yml` includes a `package` job that runs `cargo publish --dry-run`
-on every PR. This catches packaging issues (missing files, manifest
-problems, doc-test fail under the published-crate build) **before** the
-Release PR is merged — i.e., before release-please has cut a tag that
-the real `cargo publish` would have to consume.
-
-### Recovery: auto-publish failed
-
-`release-please-action` sets its `release_created` output to `true` only on
-the run that actually creates the GitHub Release. If the publish step fails
-on that run (transient crates.io error, missing token, the like), simply
-re-running the workflow does **not** help — the rerun sees the existing
-release and returns `release_created=false`, so both `ci` and `publish`
-get skipped.
-
-The recovery path is the manual `Run workflow` button:
-
-1. GitHub → Actions → Release → **Run workflow**.
-2. Set `tag` to the existing release tag (e.g. `tkach-v0.4.1`).
-3. The `publish-manual` job checks out that tag and runs `cargo publish`
-   using the same `CARGO_REGISTRY_TOKEN` secret.
-
-This skips re-running the CI suite — the tag already passed CI on the
-original auto-run, the failure was specifically in the publish step.
-
-### Manual override: out-of-band release
-
-If you need to cut a release without going through release-please:
-
-```
-git tag tkach-vX.Y.Z
-git push origin tkach-vX.Y.Z
-```
-
-The `tkach-` prefix matches release-please's tag format. After pushing,
-trigger the publish workflow manually as in the recovery section above.
+Step 4 is automatic. The normal CI workflow runs independently on every
+push to `main` and on every pull request.

@@ -46,9 +46,9 @@ The result: only breaking commits cut a new minor; everything else rides patches
 Automated via [release-please](https://github.com/googleapis/release-please).
 See `RELEASING.md` for details.
 
-**Flow:** conventional commits on `main` → release-please creates Release PR → merge PR → GitHub Release + tag → CI suite re-runs against the tagged commit → `cargo publish` to crates.io. All automatic.
+**Flow:** conventional commits on `main` → release-please creates Release PR → merge PR → GitHub Release + tag. All automatic.
 
-**Do NOT** manually edit `CHANGELOG.md`, bump version, or run `cargo publish` — release-please + the publish workflow handle all three.
+**Do NOT** manually edit `CHANGELOG.md` or bump the version — release-please handles both.
 
 **When to suggest merging the Release PR:**
 - When meaningful features or fixes have accumulated

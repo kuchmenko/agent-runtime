@@ -136,7 +136,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0] - 2026-04-26
 
-Initial public release of `tkach` on crates.io.
+Initial public release of `tkach`.
 
 A provider-independent agent runtime for Rust with a stateless agent
 loop, pluggable LLM providers (Anthropic, OpenAI-compatible), built-in
