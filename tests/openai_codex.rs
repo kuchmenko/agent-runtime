@@ -152,7 +152,7 @@ async fn originator_header_can_be_overridden() {
 
     Mock::given(method("POST"))
         .and(path("/codex/responses"))
-        .and(header("originator", "sunny"))
+        .and(header("originator", "custom-client"))
         .respond_with(ok_sse(
             "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
                 .into(),
@@ -163,7 +163,7 @@ async fn originator_header_can_be_overridden() {
 
     let provider = OpenAICodex::with_static_credentials(CodexCredentials::new("t", "acct_1"))
         .with_base_url(server.uri())
-        .with_originator("sunny");
+        .with_originator("custom-client");
 
     let mut stream = provider.stream(build_request()).await.expect("stream");
     while stream.next().await.is_some() {}

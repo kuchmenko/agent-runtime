@@ -158,8 +158,8 @@ impl OpenAICodex {
     }
 
     /// Override the `originator` request header. Default `tkach`.
-    /// Apps embedding `tkach` may want to identify themselves
-    /// (e.g. `sunny`).
+    /// Apps embedding `tkach` may identify themselves with a custom
+    /// originator value.
     pub fn with_originator(mut self, originator: impl Into<String>) -> Self {
         self.originator = originator.into();
         self
@@ -462,7 +462,6 @@ mod tests {
 
     #[test]
     fn body_emits_reasoning_summary_for_responses_api() {
-        // Reproduces the bug Sunny found in real Codex traffic:
         // include=encrypted_content alone is not enough — the backend
         // only emits response.reasoning_summary_text.* when
         // reasoning.summary is set on the request.

@@ -7,20 +7,20 @@ A provider-independent agent runtime for Rust. Stateless agent loop, pluggable L
 [![CI](https://github.com/kuchmenko/tkach/actions/workflows/ci.yml/badge.svg)](https://github.com/kuchmenko/tkach/actions/workflows/ci.yml)
 [![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **Status:** pre-1.0 (`0.4.0`). Breaking changes are signalled via `feat!:` conventional commits and recorded in [`CHANGELOG.md`](./CHANGELOG.md). The core API has stabilised across foundation, streaming, approval, and reasoning milestones — and is settling — but expect motion.
+> **Status:** pre-1.0 (`0.6.0`). Breaking changes are signalled via `feat!:` conventional commits and recorded in [`CHANGELOG.md`](./CHANGELOG.md). Before 1.0, breaking changes increment the minor version.
 
 ## Features
 
 - **Stateless `Agent::run`** — caller owns the message history; the agent returns the **delta** of new messages it appended. Resume, multi-turn chat, fork & retry all become composable.
 - **Atomic events with one cancel surface** — `ToolUse` events are emitted whole, never as partial JSON; a single `CancellationToken` shuts down the loop, the SSE pull, the in-flight HTTP body, and any `bash` child process via `kill_on_drop`.
 - **Provider parity, including reasoning** — Anthropic (adaptive and manual extended thinking), OpenAI Responses (reasoning summary), ChatGPT Codex (subscription endpoint), and any OpenAI-compatible Chat Completions endpoint share one `StreamEvent` API surface — not three SDKs.
-- **Sub-agents inherit the parent's executor** — one `ApprovalHandler`, one `ToolPolicy`, one tool registry gate the whole agent tree without explicit re-plumbing (Model 3).
+- **Inherited sub-agent controls** — sub-agents fork the parent executor while retaining its tool registry, policy, approval handler, and concurrency settings.
 
 ## Quick start
 
 ```toml
 [dependencies]
-tkach = "0.4"
+tkach = "0.6"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -28,7 +28,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 use tkach::{Agent, CancellationToken, Message, providers::Anthropic, tools};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let agent = Agent::builder()
         .provider(Anthropic::from_env())
         .model(tkach::model::claude::HAIKU_20251001)
@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
 
 ### Image input
 
-User messages can mix text and images in exact block order. Images may come from in-memory bytes, an absolute local file path, or a URL:
+User messages can mix text and images in exact block order. Images are valid only in user-role messages and may come from in-memory bytes, an absolute local file path, or a URL:
 
 ```rust
 use tkach::{Content, Message};
@@ -99,10 +99,13 @@ Local image files are read asynchronously before each provider request and must 
                                                 └─────────┬─────────┘
                                                           │
                                               ┌───────────┴────────────┐
-                                              ▼                        ▼
-                                        ReadOnly: parallel       Mutating: sequential
-                                        Read · Glob · Grep ·     Write · Edit · Bash ·
-                                        WebFetch                 SubAgent
+                                              │    Tool scheduling     │
+                                              │ ReadOnly: concurrent   │
+                                              │ Recursive: concurrent  │
+                                              │ Mutating: serial by    │
+                                              │ default; opt-in        │
+                                              │ concurrency available  │
+                                              └────────────────────────┘
 ```
 
 The diagram glosses over a few invariants worth knowing up front:
@@ -121,33 +124,53 @@ The diagram glosses over a few invariants worth knowing up front:
 - **One cancellation surface.** A single `CancellationToken` reaches the
   agent loop, the SSE pull, the in-flight HTTP body, every
   `ApprovalHandler::approve` call, every `Bash` child via `kill_on_drop`,
-  and every `WebFetch`. `cancel.cancel()` shuts everything down within
-  milliseconds and the loop drops out cleanly.
-- **Sub-agents inherit the executor.** `SubAgent::execute` constructs a
-  nested agent loop using the parent's `ToolExecutor` (carried in
-  `ToolContext`), so one `ApprovalHandler` and one `ToolPolicy` gate
-  the whole agent tree — no explicit re-plumbing across recursion depth.
-- **Read-only parallelism, mutating serialization.** A `ToolUse` batch
-  is partitioned by `ToolClass`: `ReadOnly` tools (Read, Glob, Grep,
-  WebFetch and any custom tool that overrides `class()` to `ReadOnly`)
-  run via `join_all`; everything else runs sequentially in the order
-  the model emitted them.
+  and every `WebFetch`. Cancellation is cooperative for custom tools,
+  which must observe `ToolContext::cancel` themselves.
+- **Sub-agents fork the executor.** A child retains the parent's registry,
+  policy, approval behavior, and numeric concurrency settings. The read
+  and serial-mutator pools remain shared across the tree; the concurrent-
+  mutator and per-tool pools are forked per nesting level to prevent
+  parent/child permit deadlocks.
+- **Ordered concurrency.** `execute_batch` partitions calls into contiguous
+  runs of the same routing class and executes calls concurrently within
+  each run using `FuturesUnordered`. It waits between runs and returns
+  results in model-issued order. Read-only calls default to a shared cap
+  of 20. Recursive tools and explicitly promoted mutators use a cap of 10
+  per nesting level. Other mutators remain globally serial.
+
+Concurrency can be tuned from the builder. Promoting a mutating tool is a
+caller-owned safety decision: only promote tools whose calls may overlap.
+
+```rust
+use tkach::{Agent, ToolConcurrency};
+
+let agent = Agent::builder()
+    // provider, model, and tools omitted
+    .max_concurrent_reads(8)
+    .max_concurrent_mutations(4)
+    .tool_concurrency("independent_write", ToolConcurrency::on().max(2))
+    .build()?;
+```
 
 ## Built-in tools
 
-Read-only (`ToolClass::ReadOnly` — batched in parallel):
+Read-only (`ToolClass::ReadOnly` — concurrent within an ordered run):
 
 - `Read` — read file contents (numbered lines, offset/limit).
 - `Glob` — find files matching a glob (sorted by mtime).
 - `Grep` — regex search in files (with context, ignore patterns).
 - `WebFetch` — HTTP GET a URL, returns body text.
 
-Mutating (`ToolClass::Mutating` — executed sequentially):
+Mutating (`ToolClass::Mutating` — serial unless explicitly promoted):
 
 - `Write` — write a file (creates parents).
 - `Edit` — replace an exact string in a file.
 - `Bash` — run a shell command (cancel-aware via `kill_on_drop`).
-- `SubAgent` — spawn a nested agent that inherits the parent's tools and policies.
+
+Recursive:
+
+- `SubAgent` — spawn a nested agent with a forked executor. Recursive tools use
+  the concurrent-mutator pool so multiple sub-agents in one run may overlap.
 
 `tools::defaults()` returns `Read + Write + Edit + Glob + Grep + Bash`. Add `WebFetch` and `SubAgent::new(provider, model)` explicitly when you want them.
 
@@ -184,6 +207,7 @@ Prefer typed constants/enums for autocomplete and typo resistance:
 
 ```rust
 use tkach::{
+    Agent,
     model::{claude, gpt, openrouter},
     providers::{OpenAIEffort, OpenAISummary, anthropic::AnthropicEffort},
 };
@@ -220,9 +244,9 @@ Both paths emit the same `StreamEvent::ThinkingDelta` and `StreamEvent::Thinking
 
 `SystemBlock::cached`, `Content::text_cached`, and `AgentBuilder::cache_tools` mark cache breakpoints; `Usage` reports `cache_creation_input_tokens` / `cache_read_input_tokens` so callers can measure hit rate. Default TTL is 5 min, with 1 h available via `CacheControl::ephemeral_1h()`. Cache reads bill at 0.1× base input; writes at 1.25× (5 min) or 2× (1 h). See `examples/anthropic_caching.rs` and `examples/anthropic_caching_streaming.rs`.
 
-### Anthropic Message Batches (50 % async)
+### Anthropic Message Batches
 
-Anthropic's [Message Batches API](https://docs.anthropic.com/en/api/messages-batches) takes the same `Request` body, runs it asynchronously over up to 24 h, and bills **50 % off** input + output tokens. Stack with `SystemBlock::cached_1h(...)` for ≈85 % off when prefixes are stable across batches. Right call for overnight backfills, scheduled recompute jobs, evals, or any workload that doesn't care about p99.
+Anthropic's [Message Batches API](https://docs.anthropic.com/en/api/messages-batches) takes the same `Request` body and processes it asynchronously. Anthropic documents a processing window of up to 24 hours and a 50% discount on input and output tokens. It is intended for workloads that do not require immediate results, such as backfills and evaluations. Prompt caching can also apply when a request has a stable prefix; check Anthropic's current pricing before estimating cost.
 
 ```rust
 use futures::StreamExt;
@@ -241,6 +265,7 @@ let requests = vec![BatchRequest {
         tools: vec![],
         max_tokens: 64,
         temperature: None,
+        thinking: None,
     },
 }];
 
@@ -343,11 +368,19 @@ while let Some(event) = stream.next().await {
 let result = stream.into_result().await?;        // final AgentResult
 ```
 
-`TurnStarted`, `ThinkingDelta`, and `ThinkingBlock` are public `StreamEvent` variants. Downstream exhaustive matches must add arms for them when upgrading.
+The agent stream can also emit steering and policy lifecycle events:
+`ModeChanged`, `ModeChangeRequested`, `ContinuationInjected`, `GuardAborted`,
+`PolicyInstalled`, `PolicyRemoved`, and `PolicyApplied`. Provider-level
+`MessageDelta`, `Usage`, and `Done` events are consumed by the agent loop.
+Downstream exhaustive matches should include a fallback arm when they do not
+need every lifecycle event.
 
 Provider boundary: Anthropic thinking requires `Anthropic::with_adaptive_thinking*` or `with_thinking_budget(...)`; OpenAI thinking requires `OpenAIResponses` (`/responses` with `reasoning.summary`). `OpenAICompatible` is Chat Completions and intentionally asserts the no-thinking contract because that wire format has no standard reasoning-summary event.
 
-Backpressure is real: a slow consumer parks the producer task, which closes the SSE read side, which lets the OS shrink the TCP receive window — all the way back to the LLM server. Cancellation works mid-stream too: `cancel.cancel()` aborts the current SSE pull within milliseconds via `tokio::select!`.
+`AgentStream` uses a bounded 16-event channel, so a slow consumer pauses the
+producer after the buffer fills. Cancellation is raced against each provider
+pull and against approval and execution admission. Actual shutdown latency
+still depends on the provider, network, and whether custom tools cooperate.
 
 Steering-aware callers can use `run_with_handle` / `stream_with_handle` to get an `AgentHandle` for the active run:
 
@@ -447,7 +480,12 @@ let agent = Agent::builder()
 
 Tool scoping is an intersection with the parent policy: a child allow-list can remove capability, never re-add a tool denied by the parent. Leave `filter_tool_definitions(false)` to keep prompt-cache hashes stable and let denied calls return tool-result errors; enable it when the child should not even see disallowed tools.
 
-**Mutating SubAgents must set `trace_hook`.** A child whose `tools_allow` includes `edit`, `write`, or `bash` writes user data — its decisions need per-turn parent observability. Without a trace, the parent receives only a single opaque summary and loses the implicit decision trail. This is Cognition AI's "Share full agent traces, not just individual messages" principle ([Don't build multi-agents](https://cognition.ai/blog/dont-build-multi-agents); [follow-up](https://cognition.ai/blog/multi-agents-working) on read-vs-write distinction). Read-only profiles ship safely without `trace_hook`; mutating profiles register one wired to an audit sink.
+`trace_hook` is optional. Configure it when the parent needs every child
+`StreamEvent`, for example to observe a mutating child's intermediate tool
+calls. Without a hook, the child uses the buffered `Agent::run` path and the
+parent receives its final summary. The hook affects observability, not tool
+permissions; use `tools_allow`, `ToolPolicy`, and `ApprovalHandler` to control
+capabilities.
 
 ```rust
 let writer = SubAgent::new(provider, tkach::model::claude::SONNET)
@@ -457,7 +495,7 @@ let writer = SubAgent::new(provider, tkach::model::claude::SONNET)
     .trace_hook(move |ev| audit_sink.record(ev));
 ```
 
-See [`examples/specialised_subagents.rs`](./examples/specialised_subagents.rs) for the three canonical profiles registered side-by-side: read-only research, autonomous reasoning with `approval_handler(AutoApprove)`, and mutating writer with `trace_hook`.
+See [`examples/specialised_subagents.rs`](./examples/specialised_subagents.rs) for three configurations registered side-by-side: read-only research, autonomous reasoning with `approval_handler(AutoApprove)`, and a mutating writer with `trace_hook`.
 
 ## Custom tools
 
@@ -489,7 +527,8 @@ Long-running tools should `tokio::select!` on `ctx.cancel.cancelled()` and retur
 
 ## Examples
 
-Each runnable demo also asserts its invariants — `cargo run --example NAME` either prints the demo and exits 0, or panics with a clear message.
+All examples are compiled in CI. Deterministic examples assert their key
+behavior; `typed_pipeline.rs` is compile-time configuration documentation.
 
 - [`basic.rs`](./examples/basic.rs) — Minimal `agent.run`.
 - [`streaming.rs`](./examples/streaming.rs) — Anthropic streaming with visible/thinking event handling.
@@ -504,7 +543,11 @@ Each runnable demo also asserts its invariants — `cargo run --example NAME` ei
 - [`streaming_cancel.rs`](./examples/streaming_cancel.rs) — Cancel mid-generation, partial text preserved.
 - [`streaming_resilience.rs`](./examples/streaming_resilience.rs) — Tool failure + cancel-during-tool + multi-block turns.
 - [`approval_flow.rs`](./examples/approval_flow.rs) — Live denial flow with custom `ApprovalHandler`.
-- [`parallel_tools.rs`](./examples/parallel_tools.rs) — Read-only tools running in parallel.
+- [`parallel_tools.rs`](./examples/parallel_tools.rs) — Ordered read-only and mutating runs.
+- [`parallel_writes.rs`](./examples/parallel_writes.rs) — Explicitly promote independent writes for concurrency.
+- [`parallel_subagents.rs`](./examples/parallel_subagents.rs) — Concurrent sub-agent fan-out with bounded admission.
+- [`steering_edge_cases.rs`](./examples/steering_edge_cases.rs) — Deterministic queue, interrupt, mode, and prompt-policy checks.
+- [`typed_pipeline.rs`](./examples/typed_pipeline.rs) — Compile-time typed model and thinking configuration.
 - [`custom_tool.rs`](./examples/custom_tool.rs) — Defining your own tool.
 - [`anthropic_caching.rs`](./examples/anthropic_caching.rs) — Prompt caching: cache_creation vs cache_read on the second call.
 - [`anthropic_caching_streaming.rs`](./examples/anthropic_caching_streaming.rs) — Same shape, but through the streaming API.
@@ -525,7 +568,11 @@ cargo run --example streaming    # any of the runnable examples
 
 The image-input smoke tests use a generated two-color PNG and verify real multimodal interpretation across each configured provider. Anthropic additionally verifies an absolute file source followed by a text-only turn that replays the same image history. OpenAI-compatible, Responses, and Codex tests skip when their provider-specific credentials are absent; see [`.env.example`](./.env.example) for model and endpoint overrides.
 
-CI runs fmt, clippy (with cognitive-complexity gates), MSRV (1.86), and `cargo deny` on every PR. Real-API smoke runs are gated behind `Actions → Integration Tests → Run workflow → tier=smoke|full`.
+CI runs formatting, clippy, all-target tests with coverage, RustSec audit,
+`cargo deny`, an MSRV 1.86 check, and `cargo publish --dry-run`. Clippy warnings
+other than `cognitive_complexity` and `too_many_lines` fail the build; those two
+are reported through SARIF without gating CI. Real-API tests run only through
+`Actions → Integration Tests → Run workflow → tier=smoke|full`.
 
 ## Versioning & releases
 

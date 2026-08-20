@@ -1,14 +1,9 @@
 //! Demonstrates parallel sub-agent fan-out for codebase exploration.
 //!
-//! Without `tool_concurrency("agent", ToolConcurrency::on())`, every
-//! sub-agent invocation routes to the width-1 serial-mutator pool —
-//! three sub-agents in one parent batch run back-to-back, so wall time
-//! ≈ 3× single-agent walltime.
-//!
-//! With the opt-in, sub-agents route to the concurrent-mutator pool
-//! (default cap 10). All three overlap, each spending most of its time
-//! in its inner `slow_reader` call. Wall time ≈ 1× single-agent
-//! walltime.
+//! `SubAgent` identifies itself as a recursive tool, so the executor routes
+//! it to the concurrent-mutator pool automatically. All three calls overlap,
+//! each spending most of its time in its inner `slow_reader` call. Wall time
+//! is therefore ≈ 1× single-agent walltime rather than ≈ 3×.
 //!
 //! The example asserts the parallel wall time and that all three
 //! results are returned in the original `tool_use` order.
@@ -23,8 +18,7 @@ use tkach::provider::Response;
 use tkach::providers::Mock;
 use tkach::tools::SubAgent;
 use tkach::{
-    Agent, CancellationToken, Message, Tool, ToolClass, ToolConcurrency, ToolContext, ToolError,
-    ToolOutput,
+    Agent, CancellationToken, Message, Tool, ToolClass, ToolContext, ToolError, ToolOutput,
 };
 
 /// A `ReadOnly` tool used inside each sub-agent to make wall-time
@@ -146,11 +140,7 @@ async fn main() {
             delay_ms: inner_delay_ms,
         })
         .tool(SubAgent::new(Arc::clone(&sub_provider), "mock-sub").max_turns(3))
-        // Promote the SubAgent tool into the concurrent-mutator pool.
-        // Without this, the three `agent` tool_use blocks would route
-        // through the width-1 serial pool and wall time would be ≈ 3×
-        // inner-delay instead of ≈ 1×.
-        .tool_concurrency("agent", ToolConcurrency::on())
+        .max_concurrent_mutations(3)
         .build()
         .unwrap();
 
@@ -178,6 +168,6 @@ async fn main() {
     println!("delta messages: {}", result.new_messages.len());
     println!("wall time: {elapsed:?} (per-sub-agent inner delay: {inner_delay_ms}ms)");
     println!();
-    println!("Without tool_concurrency('agent', on()), this batch would take ≈ 3× inner delay.");
-    println!("With the promotion, all three sub-agents share the concurrent-mutator pool.");
+    println!("Recursive tools use the concurrent-mutator pool automatically.");
+    println!("All three sub-agents therefore overlap within the configured class cap.");
 }
