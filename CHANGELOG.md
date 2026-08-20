@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0](https://github.com/kuchmenko/tkach/compare/tkach-v0.5.0...tkach-v0.6.0) (2026-08-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* add native image input ([#51](https://github.com/kuchmenko/tkach/issues/51))
+
+### Features
+
+* add native image input ([#51](https://github.com/kuchmenko/tkach/issues/51)) ([351ddc0](https://github.com/kuchmenko/tkach/commit/351ddc0fc9dcfb3e16228f069e1be7d03b0492f9))
+
+
+### Bug Fixes
+
+* **deps:** update h2 for RUSTSEC-2026-0258 ([bde1d16](https://github.com/kuchmenko/tkach/commit/bde1d169fc6f6c13d7130f0ce32d68003510e2f3))
+
 ## [0.5.0](https://github.com/kuchmenko/tkach/compare/tkach-v0.4.0...tkach-v0.5.0) (2026-05-12)
 
 ### Added
